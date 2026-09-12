@@ -20,15 +20,20 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
+
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 )
 
 // ObjectStorageBackend is the interface for persisting objects to backing storage (e.g., S3/GCS or Memory).
 type ObjectStorageBackend interface {
-	PutObject(ctx context.Context, volumeID, key string, data []byte) (etag string, err error)
-	GetObject(ctx context.Context, volumeID, key string, offset, length int64) (data []byte, err error)
+	PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (etag string, err error)
+	GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error
 	DeleteObject(ctx context.Context, volumeID, key string) error
 	GetRedirectURL(ctx context.Context, volumeID, key string) (string, error)
+	ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error)
 }
 
 // MemoryBackend is an in-memory implementation of ObjectStorageBackend.
@@ -45,44 +50,51 @@ func NewMemoryBackend() *MemoryBackend {
 }
 
 func (m *MemoryBackend) storageKey(volumeID, key string) string {
+	if volumeID == "" || strings.HasPrefix(key, "volumes/") || strings.HasPrefix(key, "blobs/") {
+		return key
+	}
 	return fmt.Sprintf("%s/%s", volumeID, key)
 }
 
-func (m *MemoryBackend) PutObject(ctx context.Context, volumeID, key string, data []byte) (string, error) {
+func (m *MemoryBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	k := m.storageKey(volumeID, key)
-	buf := make([]byte, len(data))
-	copy(buf, data)
+	if err := stream.Rewind(); err != nil {
+		return "", err
+	}
+	buf, err := io.ReadAll(stream)
+	if err != nil {
+		return "", err
+	}
 	m.objects[k] = buf
 
 	h := sha256.Sum256(buf)
 	return fmt.Sprintf("%x", h), nil
 }
 
-func (m *MemoryBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64) ([]byte, error) {
+func (m *MemoryBackend) GetObject(ctx context.Context, volumeID, key string, offset, length int64, w io.Writer) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	k := m.storageKey(volumeID, key)
 	data, ok := m.objects[k]
 	if !ok {
-		return nil, fmt.Errorf("object %s not found in volume %s", key, volumeID)
+		return fmt.Errorf("object %s not found in volume %s", key, volumeID)
 	}
 
 	total := int64(len(data))
 	if offset >= total {
-		return []byte{}, nil
+		return nil
 	}
 	end := offset + length
 	if length <= 0 || end > total {
 		end = total
 	}
 
-	res := make([]byte, end-offset)
-	copy(res, data[offset:end])
-	return res, nil
+	_, err := w.Write(data[offset:end])
+	return err
 }
 
 func (m *MemoryBackend) DeleteObject(ctx context.Context, volumeID, key string) error {
@@ -97,4 +109,18 @@ func (m *MemoryBackend) DeleteObject(ctx context.Context, volumeID, key string) 
 func (m *MemoryBackend) GetRedirectURL(ctx context.Context, volumeID, key string) (string, error) {
 	// For memory backend or when direct redirect is not used, returns empty string.
 	return "", nil
+}
+
+func (m *MemoryBackend) ListObjects(ctx context.Context, volumeID, prefix string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	fullPrefix := m.storageKey(volumeID, prefix)
+	var matches []string
+	for k := range m.objects {
+		if strings.HasPrefix(k, fullPrefix) {
+			matches = append(matches, k)
+		}
+	}
+	return matches, nil
 }
