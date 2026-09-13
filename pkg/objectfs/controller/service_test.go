@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 )
 
@@ -652,5 +653,103 @@ func TestErofsSnapshotRollback(t *testing.T) {
 	}
 	if string(readResp2.Data) != "version 2 data overwritten" {
 		t.Fatalf("Expected 'version 2 data overwritten' after restore to snap2, got %q", string(readResp2.Data))
+	}
+}
+
+func TestCSIControllerOperations(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	csiController := NewCSIController(server)
+
+	// 1. GetPluginInfo
+	pluginInfo, err := csiController.GetPluginInfo(ctx, &csi.GetPluginInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginInfo failed: %v", err)
+	}
+	if pluginInfo.GetName() != "objectfs.labs.gke.io" {
+		t.Fatalf("Expected plugin name objectfs.labs.gke.io, got %s", pluginInfo.GetName())
+	}
+
+	// 2. GetPluginCapabilities
+	pluginCaps, err := csiController.GetPluginCapabilities(ctx, &csi.GetPluginCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginCapabilities failed: %v", err)
+	}
+	if len(pluginCaps.GetCapabilities()) == 0 {
+		t.Fatalf("Expected plugin capabilities, got none")
+	}
+
+	// 3. Probe
+	if _, err := csiController.Probe(ctx, &csi.ProbeRequest{}); err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+
+	// 4. ControllerGetCapabilities
+	ctrlCaps, err := csiController.ControllerGetCapabilities(ctx, &csi.ControllerGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("ControllerGetCapabilities failed: %v", err)
+	}
+	hasCreateDelete := false
+	for _, cap := range ctrlCaps.GetCapabilities() {
+		if cap.GetRpc().GetType() == csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME {
+			hasCreateDelete = true
+		}
+	}
+	if !hasCreateDelete {
+		t.Fatalf("Expected CREATE_DELETE_VOLUME capability")
+	}
+
+	// 5. CreateVolume
+	createVolResp, err := csiController.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: "test-pvc-volume-1",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 5 * 1024 * 1024 * 1024,
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		Parameters: map[string]string{
+			"writeMode": "lazy",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume failed: %v", err)
+	}
+	if createVolResp.GetVolume().GetVolumeId() != "test-pvc-volume-1" {
+		t.Fatalf("Unexpected volume ID: %s", createVolResp.GetVolume().GetVolumeId())
+	}
+	if createVolResp.GetVolume().GetCapacityBytes() != 5*1024*1024*1024 {
+		t.Fatalf("Unexpected capacity bytes: %d", createVolResp.GetVolume().GetCapacityBytes())
+	}
+	if createVolResp.GetVolume().GetVolumeContext()["writeMode"] != "lazy" {
+		t.Fatalf("Unexpected volume context writeMode: %s", createVolResp.GetVolume().GetVolumeContext()["writeMode"])
+	}
+
+	// 6. ValidateVolumeCapabilities
+	valResp, err := csiController.ValidateVolumeCapabilities(ctx, &csi.ValidateVolumeCapabilitiesRequest{
+		VolumeId: "test-pvc-volume-1",
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ValidateVolumeCapabilities failed: %v", err)
+	}
+	if valResp.GetConfirmed() == nil {
+		t.Fatalf("Expected confirmed capabilities")
+	}
+
+	// 7. DeleteVolume
+	if _, err := csiController.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "test-pvc-volume-1"}); err != nil {
+		t.Fatalf("DeleteVolume failed: %v", err)
 	}
 }

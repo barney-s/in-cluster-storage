@@ -196,3 +196,178 @@ spec:
 	h.DeletePod(pod3Name, "default")
 	t.Logf("Successfully verified ObjectFS multi-writer FUSE CSI driver!")
 }
+
+func TestObjectFSStatefulSetE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping ObjectFS StatefulSet E2E test; RUN_E2E not set")
+	}
+
+	h := NewHarness(t, "objectfs-statefulset-e2e")
+	h.Setup()
+
+	gitRoot := h.GetGitRoot()
+	experimentRoot := gitRoot
+
+	// Build docker images
+	h.DockerBuild("objectfs-controller:e2e", filepath.Join(experimentRoot, "images/objectfs-controller/Dockerfile"), experimentRoot)
+	h.DockerBuild("objectfs-node-daemon:e2e", filepath.Join(experimentRoot, "images/objectfs-node-daemon/Dockerfile"), experimentRoot)
+
+	// Load images into Kind
+	h.KindLoad("objectfs-controller:e2e")
+	h.KindLoad("objectfs-node-daemon:e2e")
+
+	// Read and adapt manifest
+	manifestPath := filepath.Join(experimentRoot, "k8s/objectfs.yaml")
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read manifest: %v", err)
+	}
+	manifest := string(b)
+	manifest = strings.ReplaceAll(manifest, "namespace: kube-objectfs-system", "namespace: default")
+	manifest = strings.ReplaceAll(manifest, "image: objectfs-controller:latest", "image: objectfs-controller:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: objectfs-node-daemon:latest", "image: objectfs-node-daemon:e2e\n          imagePullPolicy: Never")
+
+	// Apply ObjectFS CSI driver and controller
+	h.KubectlApplyContent("objectfs", manifest)
+
+	// Wait for controller
+	if err := h.WaitForStatefulSet("objectfs-controller", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("ObjectFS Controller failed to start: %v", err)
+	}
+
+	// Wait for node-daemon
+	if err := h.WaitForDaemonSet("objectfs-node-daemon", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("ObjectFS Node Daemon failed to start: %v", err)
+	}
+
+	// Deploy StatefulSet with Dynamic Volume Provisioning via StorageClass
+	statefulSetYaml := `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dev-vscode
+data:
+  settings.json: |
+    {
+      "editor.fontSize": 14
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-vscode
+type: Opaque
+data:
+  password: cGFzc3dvcmQ=
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dev-vscode
+spec:
+  ports:
+    - port: 80
+      targetPort: 80
+  selector:
+    app: dev-vscode
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dev-vscode
+spec:
+  serviceName: dev-vscode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dev-vscode
+  template:
+    metadata:
+      labels:
+        app: dev-vscode
+    spec:
+      initContainers:
+        - name: init
+          image: debian:bookworm-slim
+          command: ["/bin/sh", "-c", "mkdir -p /vscode-server/workspace"]
+          volumeMounts:
+            - name: dev-vscode-data
+              mountPath: /vscode-server
+      containers:
+        - name: app
+          image: debian:bookworm-slim
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: dev-vscode-data
+              mountPath: /vscode-server
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dev-vscode
+                  key: password
+          command: ["/bin/sh", "-c", "sleep infinity"]
+  volumeClaimTemplates:
+    - metadata:
+        name: dev-vscode-data
+      spec:
+        storageClassName: objectfs-standard
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+`
+	t.Logf("Applying VSCode StatefulSet with ObjectFS StorageClass")
+	h.KubectlApplyContent("dev-vscode", statefulSetYaml)
+
+	podName := "dev-vscode-0"
+	t.Logf("Waiting for StatefulSet pod %s to be ready", podName)
+	if err := h.WaitForPodReady(podName, "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Logf("Controller Logs:\n%s\n", h.GetPodLogsByName("objectfs-controller-0", "default"))
+		t.Logf("Node Daemon Logs:\n%s\n", h.GetPodLogs("app=objectfs-node-daemon", "default"))
+		t.Fatalf("StatefulSet pod %s failed to start: %v", podName, err)
+	}
+
+	// Step 1: Write a file via kubectl exec inside the pod
+	t.Logf("Writing data inside %s", podName)
+	_, err = h.RunInPod(podName, "default", "/bin/sh", "-c", "echo 'hello from vscode statefulset' > /vscode-server/workspace/test.txt && sync")
+	if err != nil {
+		t.Fatalf("Failed to write test.txt in %s: %v", podName, err)
+	}
+
+	// Verify the file can be read back
+	out, err := h.RunInPod(podName, "default", "cat", "/vscode-server/workspace/test.txt")
+	if err != nil {
+		t.Fatalf("Failed to read test.txt in %s: %v", podName, err)
+	}
+	if !strings.Contains(out, "hello from vscode statefulset") {
+		t.Fatalf("Expected content 'hello from vscode statefulset', got: %s", out)
+	}
+
+	// Step 2: Delete the pod and verify persistence across StatefulSet pod recreation
+	t.Logf("Deleting pod %s to test data persistence", podName)
+	h.DeletePod(podName, "default")
+
+	t.Logf("Waiting for recreated pod %s to be ready", podName)
+	if err := h.WaitForPodReady(podName, "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("Recreated pod %s failed to become ready: %v", podName, err)
+	}
+
+	// Verify persisted data after recreation
+	t.Logf("Reading data from recreated pod %s", podName)
+	outAfterRestart, err := h.RunInPod(podName, "default", "cat", "/vscode-server/workspace/test.txt")
+	if err != nil {
+		t.Fatalf("Failed to read test.txt after recreation in %s: %v", podName, err)
+	}
+	if !strings.Contains(outAfterRestart, "hello from vscode statefulset") {
+		t.Fatalf("Expected content 'hello from vscode statefulset' after recreation, got: %s", outAfterRestart)
+	}
+
+	t.Logf("Successfully verified ObjectFS dynamic provisioning with StatefulSet!")
+}

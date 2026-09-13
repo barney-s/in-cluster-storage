@@ -21,6 +21,7 @@ spec:
   podInfoOnMount: true
   volumeLifecycleModes:
     - Ephemeral
+    - Persistent
 
 ---
 
@@ -133,6 +134,58 @@ spec:
 ---
 
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: objectfs-controller
+  namespace: kube-objectfs-system
+
+---
+
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: objectfs-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+
+---
+
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: objectfs-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: objectfs-controller
+    namespace: kube-objectfs-system
+roleRef:
+  kind: ClusterRole
+  name: objectfs-controller-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: v1
 kind: Service
 metadata:
   name: objectfs-controller
@@ -162,11 +215,42 @@ spec:
       labels:
         app: objectfs-controller
     spec:
+      serviceAccountName: objectfs-controller
       containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - "--v=5"
+            - "--csi-address=$(ADDRESS)"
+            - "--feature-gates=Topology=false"
+            - "--extra-create-metadata"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
         - name: objectfs-controller
           image: objectfs-controller:latest
           args:
             - "--v=5"
             - "--port=50051"
+            - "--csi-endpoint=unix:///csi/csi.sock"
           ports:
             - containerPort: 50051
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: objectfs-standard
+provisioner: objectfs.labs.gke.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete

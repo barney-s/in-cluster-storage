@@ -1,0 +1,100 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: objectfs-standard
+provisioner: objectfs.labs.gke.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vscode-server-config
+data:
+  settings.json: |
+    {
+      "editor.fontSize": 14,
+      "workbench.colorTheme": "Default Dark+"
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vscode-server-secret
+type: Opaque
+data:
+  password: cGFzc3dvcmQ= # "password" base64-encoded
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vscode-server
+spec:
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+  selector:
+    app: vscode-server
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vscode-server
+spec:
+  serviceName: vscode-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vscode-server
+  template:
+    metadata:
+      labels:
+        app: vscode-server
+    spec:
+      initContainers:
+        - name: init
+          image: debian:bookworm-slim
+          command: ["/bin/sh", "-c", "mkdir -p /vscode-server/workspace /vscode-server/data"]
+          volumeMounts:
+            - name: vscode-data
+              mountPath: /vscode-server
+      containers:
+        - name: app
+          image: debian:bookworm-slim
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: vscode-data
+              mountPath: /vscode-server
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vscode-server-secret
+                  key: password
+  volumeClaimTemplates:
+    - metadata:
+        name: vscode-data
+      spec:
+        storageClassName: objectfs-standard
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

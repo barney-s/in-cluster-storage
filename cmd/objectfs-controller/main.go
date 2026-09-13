@@ -21,8 +21,12 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
 	"google.golang.org/grpc"
@@ -31,8 +35,21 @@ import (
 
 var (
 	port          = flag.Int("port", 50051, "The server port")
+	csiEndpoint   = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
 	flushInterval = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 )
+
+func parseEndpoint(endpoint string) (string, string, error) {
+	parts := strings.SplitN(endpoint, "://", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid endpoint: %s", endpoint)
+	}
+	scheme, addr := parts[0], parts[1]
+	if scheme != "unix" && scheme != "tcp" {
+		return "", "", fmt.Errorf("invalid endpoint: %s", endpoint)
+	}
+	return scheme, addr, nil
+}
 
 func main() {
 	klog.InitFlags(nil)
@@ -46,6 +63,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 	backend := controller.NewMemoryBackend()
 	server := controller.NewServer(backend)
+	csiController := controller.NewCSIController(server)
 
 	if *flushInterval > 0 {
 		server.StartPeriodicFlush(context.Background(), *flushInterval)
@@ -53,6 +71,38 @@ func main() {
 	}
 
 	pb.RegisterObjectFSControllerServer(grpcServer, server)
+	csi.RegisterIdentityServer(grpcServer, csiController)
+	csi.RegisterControllerServer(grpcServer, csiController)
+
+	if *csiEndpoint != "" {
+		proto, addr, err := parseEndpoint(*csiEndpoint)
+		if err != nil {
+			klog.Fatalf("failed to parse csi-endpoint %s: %v", *csiEndpoint, err)
+		}
+
+		if proto == "unix" {
+			addr = filepath.FromSlash(addr)
+			if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+				klog.Fatalf("failed to remove %s: %v", addr, err)
+			}
+		}
+
+		csiListener, err := net.Listen(proto, addr)
+		if err != nil {
+			klog.Fatalf("failed to listen on CSI endpoint %s: %v", *csiEndpoint, err)
+		}
+
+		csiServer := grpc.NewServer()
+		csi.RegisterIdentityServer(csiServer, csiController)
+		csi.RegisterControllerServer(csiServer, csiController)
+
+		go func() {
+			klog.Infof("ObjectFS CSI controller listening on %s", *csiEndpoint)
+			if err := csiServer.Serve(csiListener); err != nil {
+				klog.Fatalf("failed to serve CSI controller: %v", err)
+			}
+		}()
+	}
 
 	klog.Infof("ObjectFS Controller listening on port %d (flushInterval=%v)", *port, *flushInterval)
 	if err := grpcServer.Serve(listener); err != nil {
