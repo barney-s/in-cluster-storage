@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -227,7 +229,8 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 
 	// Before flush, backend should not have the raw objects
-	if _, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 0); err == nil {
+	var dummyBuf bytes.Buffer
+	if err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 0, &dummyBuf); err == nil {
 		t.Fatalf("Expected backend to not have file1 before flush")
 	}
 
@@ -237,12 +240,16 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 
 	// Verify raw objects and metadata file exist in backend
-	f1Data, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100)
+	var f1Buf bytes.Buffer
+	err = backend.GetObject(ctx, volumeID, "file1.txt", 0, 100, &f1Buf)
+	f1Data := f1Buf.Bytes()
 	if err != nil || string(f1Data) != "file 1 initial data" {
 		t.Fatalf("Expected file1 in backend with initial data, got: %q, err: %v", string(f1Data), err)
 	}
 
-	metaBytes, err := backend.GetObject(ctx, volumeID, MetadataFileName, 0, 0)
+	var metaBuf bytes.Buffer
+	err = backend.GetObject(ctx, volumeID, MetadataFileName, 0, 0, &metaBuf)
+	metaBytes := metaBuf.Bytes()
 	if err != nil || len(metaBytes) == 0 {
 		t.Fatalf("Expected metadata file in backend, got err: %v", err)
 	}
@@ -284,12 +291,15 @@ func TestBackendPeriodicAndIncrementalFlush(t *testing.T) {
 	}
 
 	// Verify file2 updated and file1 deleted in backend
-	f2Data, err := backend.GetObject(ctx, volumeID, "file2.txt", 0, 100)
+	var f2Buf bytes.Buffer
+	err = backend.GetObject(ctx, volumeID, "file2.txt", 0, 100, &f2Buf)
+	f2Data := f2Buf.Bytes()
 	if err != nil || string(f2Data) != "file 2 updated content!" {
 		t.Fatalf("Expected updated file2 in backend, got: %q, err: %v", string(f2Data), err)
 	}
 
-	if _, err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100); err == nil {
+	var f1DeletedBuf bytes.Buffer
+	if err := backend.GetObject(ctx, volumeID, "file1.txt", 0, 100, &f1DeletedBuf); err == nil {
 		t.Fatalf("Expected file1 to be deleted from backend after unlink & flush")
 	}
 
@@ -334,7 +344,9 @@ func TestPeriodicFlusherLifecycle(t *testing.T) {
 	server.StopPeriodicFlush()
 
 	// Verify backend received the file
-	data, err := backend.GetObject(ctx, volumeID, "auto-flushed.txt", 0, 100)
+	var autoBuf bytes.Buffer
+	err = backend.GetObject(ctx, volumeID, "auto-flushed.txt", 0, 100, &autoBuf)
+	data := autoBuf.Bytes()
 	if err != nil || string(data) != "auto flushed data" {
 		t.Fatalf("Expected periodic flusher to sync auto-flushed.txt to backend, got %q (err=%v)", string(data), err)
 	}
@@ -422,5 +434,223 @@ func TestEventBroadcasterSlowSubscriber(t *testing.T) {
 		case <-timeout:
 			t.Fatalf("Timed out waiting for full subscriber channel to be closed")
 		}
+	}
+}
+
+func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-erofs-snap-vol"
+
+	// Create a nested directory hierarchy and files
+	_, err := server.Mkdir(ctx, &pb.MkdirRequest{
+		VolumeId: volumeID,
+		Path:     "/data",
+	})
+	if err != nil {
+		t.Fatalf("Mkdir /data failed: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/data/file1.txt",
+		Mode:           0644,
+		InitialContent: []byte("file 1 content for snapshot"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/root-file.txt",
+		Mode:           0644,
+		InitialContent: []byte("root file content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Create snapshot
+	snapName, err := server.CreateSnapshot(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+	if snapName == "" || !strings.HasSuffix(snapName, ".erofs") {
+		t.Fatalf("Expected .erofs snapshot name, got: %s", snapName)
+	}
+
+	// Verify backend object layout:
+	// 1. volumes/<volumeID>/meta/<snapName> exists
+	snapKey := "volumes/" + volumeID + "/meta/" + snapName
+	var snapBuf bytes.Buffer
+	err = backend.GetObject(ctx, "", snapKey, 0, 0, &snapBuf)
+	snapBytes := snapBuf.Bytes()
+	if err != nil || len(snapBytes) == 0 {
+		t.Fatalf("Expected EROFS snapshot in backend at %s: %v", snapKey, err)
+	}
+
+	// 2. Blobs exist in blobs/ (packfiles or standalone)
+	blobObjects, err := backend.ListObjects(ctx, "", "blobs/")
+	if err != nil || len(blobObjects) == 0 {
+		t.Fatalf("Expected blobs in backend under blobs/, got: %v (err=%v)", blobObjects, err)
+	}
+
+	// 3. List snapshots returns the snapshot
+	snapshots, err := server.ListSnapshots(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0] != snapName {
+		t.Fatalf("Expected snapshots [%s], got %v", snapName, snapshots)
+	}
+
+	// 4. Test Recovery on a new Server instance using only the backend
+	newServer := NewServer(backend)
+
+	// Verify directory structure on recovered server
+	dirResp, err := newServer.ReadDir(ctx, &pb.ReadDirRequest{
+		VolumeId: volumeID,
+		Path:     "/data",
+	})
+	if err != nil {
+		t.Fatalf("Recovered server ReadDir /data failed: %v", err)
+	}
+	if len(dirResp.Entries) != 1 || dirResp.Entries[0].Name != "file1.txt" {
+		t.Fatalf("Unexpected entries in recovered /data: %v", dirResp.Entries)
+	}
+
+	// Read content from recovered server (verifying lazy blob download)
+	readResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/data/file1.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Recovered server ReadFile failed: %v", err)
+	}
+	if string(readResp.Data) != "file 1 content for snapshot" {
+		t.Fatalf("Recovered data mismatch: got %q", string(readResp.Data))
+	}
+
+	readRootResp, err := newServer.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/root-file.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("Recovered server ReadFile root-file failed: %v", err)
+	}
+	if string(readRootResp.Data) != "root file content" {
+		t.Fatalf("Recovered root data mismatch: got %q", string(readRootResp.Data))
+	}
+}
+
+func TestErofsSnapshotRollback(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-rollback-vol"
+
+	// State 1: create v1
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/doc.txt",
+		Mode:           0644,
+		InitialContent: []byte("version 1 data"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	snap1, err := server.CreateSnapshot(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("CreateSnapshot 1 failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// State 2: modify doc.txt and add doc2.txt
+	_, err = server.WriteFile(ctx, &pb.WriteFileRequest{
+		VolumeId: volumeID,
+		Path:     "/doc.txt",
+		Offset:   0,
+		Data:     []byte("version 2 data overwritten"),
+	})
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/doc2.txt",
+		Mode:           0644,
+		InitialContent: []byte("version 2 second document"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile doc2 failed: %v", err)
+	}
+
+	snap2, err := server.CreateSnapshot(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("CreateSnapshot 2 failed: %v", err)
+	}
+
+	// Verify 2 snapshots listed
+	snapshots, err := server.ListSnapshots(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(snapshots) < 2 {
+		t.Fatalf("Expected at least 2 snapshots, got %d", len(snapshots))
+	}
+
+	// Roll back to snap1
+	if err := server.RestoreSnapshot(ctx, volumeID, snap1); err != nil {
+		t.Fatalf("RestoreSnapshot to %s failed: %v", snap1, err)
+	}
+
+	// Read /doc.txt -> should be version 1 data
+	readResp, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/doc.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("ReadFile after rollback failed: %v", err)
+	}
+	if string(readResp.Data) != "version 1 data" {
+		t.Fatalf("Expected 'version 1 data' after rollback, got %q", string(readResp.Data))
+	}
+
+	// /doc2.txt should not exist
+	_, err = server.GetAttr(ctx, &pb.GetAttrRequest{
+		VolumeId: volumeID,
+		Path:     "/doc2.txt",
+	})
+	if err == nil {
+		t.Fatalf("Expected /doc2.txt to not exist after rollback to snap1")
+	}
+
+	// Now roll forward to snap2
+	if err := server.RestoreSnapshot(ctx, volumeID, snap2); err != nil {
+		t.Fatalf("RestoreSnapshot to %s failed: %v", snap2, err)
+	}
+
+	readResp2, err := server.ReadFile(ctx, &pb.ReadFileRequest{
+		VolumeId: volumeID,
+		Path:     "/doc.txt",
+		Offset:   0,
+		Size:     1024,
+	})
+	if err != nil {
+		t.Fatalf("ReadFile after restore to snap2 failed: %v", err)
+	}
+	if string(readResp2.Data) != "version 2 data overwritten" {
+		t.Fatalf("Expected 'version 2 data overwritten' after restore to snap2, got %q", string(readResp2.Data))
 	}
 }
