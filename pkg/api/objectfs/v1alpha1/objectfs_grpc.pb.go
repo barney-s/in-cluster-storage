@@ -33,21 +33,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ObjectFSController_GetAttr_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/GetAttr"
-	ObjectFSController_Lookup_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Lookup"
-	ObjectFSController_ReadDir_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ReadDir"
-	ObjectFSController_Mkdir_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Mkdir"
-	ObjectFSController_CreateFile_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/CreateFile"
-	ObjectFSController_ReadFile_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/ReadFile"
-	ObjectFSController_WriteFile_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/WriteFile"
-	ObjectFSController_TruncateFile_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/TruncateFile"
-	ObjectFSController_Unlink_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Unlink"
-	ObjectFSController_Rmdir_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Rmdir"
-	ObjectFSController_Rename_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Rename"
-	ObjectFSController_Fsync_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Fsync"
-	ObjectFSController_WatchVolume_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/WatchVolume"
-	ObjectFSController_ListBlobs_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
-	ObjectFSController_GetBlob_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
+	ObjectFSController_GetAttr_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetAttr"
+	ObjectFSController_Lookup_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Lookup"
+	ObjectFSController_ReadDir_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/ReadDir"
+	ObjectFSController_Mkdir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Mkdir"
+	ObjectFSController_CreateFile_FullMethodName     = "/objectfs.v1alpha1.ObjectFSController/CreateFile"
+	ObjectFSController_ReadFile_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/ReadFile"
+	ObjectFSController_WriteFile_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/WriteFile"
+	ObjectFSController_TruncateFile_FullMethodName   = "/objectfs.v1alpha1.ObjectFSController/TruncateFile"
+	ObjectFSController_Unlink_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Unlink"
+	ObjectFSController_Rmdir_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Rmdir"
+	ObjectFSController_Rename_FullMethodName         = "/objectfs.v1alpha1.ObjectFSController/Rename"
+	ObjectFSController_Fsync_FullMethodName          = "/objectfs.v1alpha1.ObjectFSController/Fsync"
+	ObjectFSController_WatchVolume_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/WatchVolume"
+	ObjectFSController_ListBlobs_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
+	ObjectFSController_GetBlob_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
+	ObjectFSController_ListVolumes_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListVolumes"
+	ObjectFSController_ListSnapshots_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/ListSnapshots"
+	ObjectFSController_CreateSnapshot_FullMethodName = "/objectfs.v1alpha1.ObjectFSController/CreateSnapshot"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -69,6 +72,9 @@ type ObjectFSControllerClient interface {
 	WatchVolume(ctx context.Context, in *WatchVolumeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchVolumeResponse], error)
 	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
 	GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error)
+	ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error)
+	ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error)
+	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
 }
 
 type objectFSControllerClient struct {
@@ -247,6 +253,36 @@ func (c *objectFSControllerClient) GetBlob(ctx context.Context, in *GetBlobReque
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_GetBlobClient = grpc.ServerStreamingClient[GetBlobResponse]
 
+func (c *objectFSControllerClient) ListVolumes(ctx context.Context, in *ListVolumesRequest, opts ...grpc.CallOption) (*ListVolumesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListVolumesResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_ListVolumes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) ListSnapshots(ctx context.Context, in *ListSnapshotsRequest, opts ...grpc.CallOption) (*ListSnapshotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSnapshotsResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_ListSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateSnapshotResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_CreateSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -266,6 +302,9 @@ type ObjectFSControllerServer interface {
 	WatchVolume(*WatchVolumeRequest, grpc.ServerStreamingServer[WatchVolumeResponse]) error
 	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
 	GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error
+	ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error)
+	ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error)
+	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -320,6 +359,15 @@ func (UnimplementedObjectFSControllerServer) ListBlobs(context.Context, *ListBlo
 }
 func (UnimplementedObjectFSControllerServer) GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error {
 	return status.Error(codes.Unimplemented, "method GetBlob not implemented")
+}
+func (UnimplementedObjectFSControllerServer) ListVolumes(context.Context, *ListVolumesRequest) (*ListVolumesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListVolumes not implemented")
+}
+func (UnimplementedObjectFSControllerServer) ListSnapshots(context.Context, *ListSnapshotsRequest) (*ListSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSnapshots not implemented")
+}
+func (UnimplementedObjectFSControllerServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSnapshot not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -598,6 +646,60 @@ func _ObjectFSController_GetBlob_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_GetBlobServer = grpc.ServerStreamingServer[GetBlobResponse]
 
+func _ObjectFSController_ListVolumes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVolumesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).ListVolumes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_ListVolumes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).ListVolumes(ctx, req.(*ListVolumesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_ListSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSnapshotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).ListSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_ListSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).ListSnapshots(ctx, req.(*ListSnapshotsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_CreateSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).CreateSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_CreateSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).CreateSnapshot(ctx, req.(*CreateSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -656,6 +758,18 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListBlobs",
 			Handler:    _ObjectFSController_ListBlobs_Handler,
+		},
+		{
+			MethodName: "ListVolumes",
+			Handler:    _ObjectFSController_ListVolumes_Handler,
+		},
+		{
+			MethodName: "ListSnapshots",
+			Handler:    _ObjectFSController_ListSnapshots_Handler,
+		},
+		{
+			MethodName: "CreateSnapshot",
+			Handler:    _ObjectFSController_CreateSnapshot_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

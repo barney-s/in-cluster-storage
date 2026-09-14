@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
@@ -284,5 +285,259 @@ func TestBlobsOverUnixSocket(t *testing.T) {
 	}
 	if getOut != string(content) {
 		t.Fatalf("mismatch: got %q, expected %q", getOut, string(content))
+	}
+}
+
+func TestVolumesList(t *testing.T) {
+	ctx := t.Context()
+	server, addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	_, err := executeCommand("volumes", "list")
+	if err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Empty list when no volumes exist
+	out, err := executeCommand("--server", addr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list failed: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("expected empty output, got: %q", out)
+	}
+
+	// 3. Create files in 3 volumes
+	volNames := []string{"vol-z", "vol-a", "vol-m"}
+	for _, v := range volNames {
+		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       v,
+			Path:           "/test.txt",
+			InitialContent: []byte("sample content for " + v),
+		})
+		if err != nil {
+			t.Fatalf("CreateFile failed for %s: %v", v, err)
+		}
+	}
+
+	// 4. List volumes -> sorted: vol-a, vol-m, vol-z
+	out, err = executeCommand("--server", addr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 volumes, got %d (output: %q)", len(lines), out)
+	}
+	expected := []string{"vol-a", "vol-m", "vol-z"}
+	for i, exp := range expected {
+		if lines[i] != exp {
+			t.Fatalf("line %d: expected %s, got %s", i, exp, lines[i])
+		}
+	}
+
+	// 5. List with alias 'vol ls'
+	aliasOut, err := executeCommand("--server", addr, "vol", "ls")
+	if err != nil {
+		t.Fatalf("vol ls failed: %v", err)
+	}
+	if strings.TrimSpace(aliasOut) != strings.TrimSpace(out) {
+		t.Fatalf("vol ls output mismatch: got %q, expected %q", aliasOut, out)
+	}
+
+	// 6. List with --limit
+	limOut, err := executeCommand("--server", addr, "volumes", "list", "--limit", "2")
+	if err != nil {
+		t.Fatalf("volumes list --limit 2 failed: %v", err)
+	}
+	limLines := strings.Split(strings.TrimSpace(limOut), "\n")
+	if len(limLines) != 2 || limLines[0] != "vol-a" || limLines[1] != "vol-m" {
+		t.Fatalf("unexpected output with limit 2: %v", limLines)
+	}
+
+	// 7. List with --from
+	fromOut, err := executeCommand("--server", addr, "volumes", "list", "--from", "vol-a")
+	if err != nil {
+		t.Fatalf("volumes list --from failed: %v", err)
+	}
+	fromLines := strings.Split(strings.TrimSpace(fromOut), "\n")
+	if len(fromLines) != 2 || fromLines[0] != "vol-m" || fromLines[1] != "vol-z" {
+		t.Fatalf("unexpected output with --from vol-a: %v", fromLines)
+	}
+}
+
+func TestSnapshotsListAndCreate(t *testing.T) {
+	ctx := t.Context()
+	server, addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	volumeID := "test-snap-cli"
+
+	// 1. Missing --server flag
+	_, err := executeCommand("snapshot", "create", volumeID)
+	if err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	_, err = executeCommand("snapshots", "list", volumeID)
+	if err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Missing volume_id
+	_, err = executeCommand("--server", addr, "snapshot", "create")
+	if err == nil || !strings.Contains(err.Error(), "volume_id is required") {
+		t.Fatalf("expected volume_id is required error, got: %v", err)
+	}
+
+	_, err = executeCommand("--server", addr, "snapshots", "list")
+	if err == nil || !strings.Contains(err.Error(), "volume_id is required") {
+		t.Fatalf("expected volume_id is required error, got: %v", err)
+	}
+
+	// 3. Create file in volume
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/doc1.txt",
+		InitialContent: []byte("doc 1 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// 4. Create snapshot 1 via CLI
+	snap1Out, err := executeCommand("--server", addr, "snapshot", "create", volumeID)
+	if err != nil {
+		t.Fatalf("snapshot create failed: %v", err)
+	}
+	snap1 := strings.TrimSpace(snap1Out)
+	if snap1 == "" || !strings.HasSuffix(snap1, ".erofs") {
+		t.Fatalf("expected .erofs snapshot output, got: %q", snap1Out)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Modify and create snapshot 2 via CLI
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/doc2.txt",
+		InitialContent: []byte("doc 2 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile 2 failed: %v", err)
+	}
+
+	snap2Out, err := executeCommand("--server", addr, "snapshots", "create", "--volume", volumeID)
+	if err != nil {
+		t.Fatalf("snapshots create with --volume flag failed: %v", err)
+	}
+	snap2 := strings.TrimSpace(snap2Out)
+	if snap2 == "" || !strings.HasSuffix(snap2, ".erofs") {
+		t.Fatalf("expected .erofs snapshot output, got: %q", snap2Out)
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Modify and create snapshot 3 via CLI
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/doc3.txt",
+		InitialContent: []byte("doc 3 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile 3 failed: %v", err)
+	}
+
+	snap3Out, err := executeCommand("--server", addr, "snapshot", "create", volumeID)
+	if err != nil {
+		t.Fatalf("snapshot create 3 failed: %v", err)
+	}
+	snap3 := strings.TrimSpace(snap3Out)
+
+	// 5. List snapshots via CLI: objectfsctl snapshots list <volume_id>
+	listOut, err := executeCommand("--server", addr, "snapshots", "list", volumeID)
+	if err != nil {
+		t.Fatalf("snapshots list failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(listOut), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 snapshots, got %d (output: %q)", len(lines), listOut)
+	}
+	if lines[0] != snap1 || lines[1] != snap2 || lines[2] != snap3 {
+		t.Fatalf("snapshots not in expected chronological order: %v (expected [%s, %s, %s])", lines, snap1, snap2, snap3)
+	}
+
+	// 6. Test snapshot list with aliases 'snap ls' and '--volume' flag
+	aliasListOut, err := executeCommand("--server", addr, "snap", "ls", "--volume", volumeID)
+	if err != nil {
+		t.Fatalf("snap ls failed: %v", err)
+	}
+	if strings.TrimSpace(aliasListOut) != strings.TrimSpace(listOut) {
+		t.Fatalf("snap ls output mismatch: got %q, expected %q", aliasListOut, listOut)
+	}
+
+	// 7. List with --limit 2
+	limOut, err := executeCommand("--server", addr, "snapshots", "list", volumeID, "--limit", "2")
+	if err != nil {
+		t.Fatalf("snapshots list --limit 2 failed: %v", err)
+	}
+	limLines := strings.Split(strings.TrimSpace(limOut), "\n")
+	if len(limLines) != 2 || limLines[0] != snap1 || limLines[1] != snap2 {
+		t.Fatalf("unexpected output with limit 2: %v", limLines)
+	}
+
+	// 8. List with --from cursor
+	fromOut, err := executeCommand("--server", addr, "snapshots", "list", volumeID, "--from", snap1)
+	if err != nil {
+		t.Fatalf("snapshots list --from failed: %v", err)
+	}
+	fromLines := strings.Split(strings.TrimSpace(fromOut), "\n")
+	if len(fromLines) != 2 || fromLines[0] != snap2 || fromLines[1] != snap3 {
+		t.Fatalf("unexpected output with --from %s: %v", snap1, fromLines)
+	}
+}
+
+func TestVolumesAndSnapshotsOverUnixSocket(t *testing.T) {
+	ctx := t.Context()
+	server, unixAddr, cleanup := startTestUnixServer(t)
+	defer cleanup()
+
+	volumeID := "unix-snap-vol"
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file.txt",
+		InitialContent: []byte("content on unix socket"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
+	}
+
+	// Test volumes list over unix socket
+	volsOut, err := executeCommand("--server", unixAddr, "volumes", "list")
+	if err != nil {
+		t.Fatalf("volumes list failed over unix socket: %v", err)
+	}
+	if !strings.Contains(volsOut, volumeID) {
+		t.Fatalf("expected %s in output %q", volumeID, volsOut)
+	}
+
+	// Test snapshot create over unix socket
+	snapOut, err := executeCommand("--server", unixAddr, "snapshot", "create", volumeID)
+	if err != nil {
+		t.Fatalf("snapshot create failed over unix socket: %v", err)
+	}
+	snapName := strings.TrimSpace(snapOut)
+	if !strings.HasSuffix(snapName, ".erofs") {
+		t.Fatalf("expected .erofs snapshot, got: %q", snapName)
+	}
+
+	// Test snapshots list over unix socket
+	snapListOut, err := executeCommand("--server", unixAddr, "snapshots", "list", volumeID)
+	if err != nil {
+		t.Fatalf("snapshots list failed over unix socket: %v", err)
+	}
+	if !strings.Contains(snapListOut, snapName) {
+		t.Fatalf("expected %s in snapshots list output %q", snapName, snapListOut)
 	}
 }
