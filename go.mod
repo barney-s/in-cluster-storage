@@ -5,6 +5,8 @@ go 1.27.1
 require (
 	github.com/container-storage-interface/spec v1.13.0
 	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260531174830-a88711ea19d3
+	github.com/hanwen/go-fuse/v2 v2.11.0
+	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
@@ -13,7 +15,8 @@ require (
 
 require (
 	github.com/go-logr/logr v1.4.3 // indirect
-	github.com/hanwen/go-fuse/v2 v2.11.0 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
