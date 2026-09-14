@@ -46,6 +46,8 @@ const (
 	ObjectFSController_Rename_FullMethodName       = "/objectfs.v1alpha1.ObjectFSController/Rename"
 	ObjectFSController_Fsync_FullMethodName        = "/objectfs.v1alpha1.ObjectFSController/Fsync"
 	ObjectFSController_WatchVolume_FullMethodName  = "/objectfs.v1alpha1.ObjectFSController/WatchVolume"
+	ObjectFSController_ListBlobs_FullMethodName    = "/objectfs.v1alpha1.ObjectFSController/ListBlobs"
+	ObjectFSController_GetBlob_FullMethodName      = "/objectfs.v1alpha1.ObjectFSController/GetBlob"
 )
 
 // ObjectFSControllerClient is the client API for ObjectFSController service.
@@ -65,6 +67,8 @@ type ObjectFSControllerClient interface {
 	Rename(ctx context.Context, in *RenameRequest, opts ...grpc.CallOption) (*RenameResponse, error)
 	Fsync(ctx context.Context, in *FsyncRequest, opts ...grpc.CallOption) (*FsyncResponse, error)
 	WatchVolume(ctx context.Context, in *WatchVolumeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchVolumeResponse], error)
+	ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error)
+	GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error)
 }
 
 type objectFSControllerClient struct {
@@ -214,6 +218,35 @@ func (c *objectFSControllerClient) WatchVolume(ctx context.Context, in *WatchVol
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_WatchVolumeClient = grpc.ServerStreamingClient[WatchVolumeResponse]
 
+func (c *objectFSControllerClient) ListBlobs(ctx context.Context, in *ListBlobsRequest, opts ...grpc.CallOption) (*ListBlobsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBlobsResponse)
+	err := c.cc.Invoke(ctx, ObjectFSController_ListBlobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *objectFSControllerClient) GetBlob(ctx context.Context, in *GetBlobRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetBlobResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ObjectFSController_ServiceDesc.Streams[1], ObjectFSController_GetBlob_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GetBlobRequest, GetBlobResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ObjectFSController_GetBlobClient = grpc.ServerStreamingClient[GetBlobResponse]
+
 // ObjectFSControllerServer is the server API for ObjectFSController service.
 // All implementations must embed UnimplementedObjectFSControllerServer
 // for forward compatibility.
@@ -231,6 +264,8 @@ type ObjectFSControllerServer interface {
 	Rename(context.Context, *RenameRequest) (*RenameResponse, error)
 	Fsync(context.Context, *FsyncRequest) (*FsyncResponse, error)
 	WatchVolume(*WatchVolumeRequest, grpc.ServerStreamingServer[WatchVolumeResponse]) error
+	ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error)
+	GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error
 	mustEmbedUnimplementedObjectFSControllerServer()
 }
 
@@ -279,6 +314,12 @@ func (UnimplementedObjectFSControllerServer) Fsync(context.Context, *FsyncReques
 }
 func (UnimplementedObjectFSControllerServer) WatchVolume(*WatchVolumeRequest, grpc.ServerStreamingServer[WatchVolumeResponse]) error {
 	return status.Error(codes.Unimplemented, "method WatchVolume not implemented")
+}
+func (UnimplementedObjectFSControllerServer) ListBlobs(context.Context, *ListBlobsRequest) (*ListBlobsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBlobs not implemented")
+}
+func (UnimplementedObjectFSControllerServer) GetBlob(*GetBlobRequest, grpc.ServerStreamingServer[GetBlobResponse]) error {
+	return status.Error(codes.Unimplemented, "method GetBlob not implemented")
 }
 func (UnimplementedObjectFSControllerServer) mustEmbedUnimplementedObjectFSControllerServer() {}
 func (UnimplementedObjectFSControllerServer) testEmbeddedByValue()                            {}
@@ -528,6 +569,35 @@ func _ObjectFSController_WatchVolume_Handler(srv interface{}, stream grpc.Server
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ObjectFSController_WatchVolumeServer = grpc.ServerStreamingServer[WatchVolumeResponse]
 
+func _ObjectFSController_ListBlobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBlobsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ObjectFSControllerServer).ListBlobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ObjectFSController_ListBlobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ObjectFSControllerServer).ListBlobs(ctx, req.(*ListBlobsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ObjectFSController_GetBlob_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GetBlobRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ObjectFSControllerServer).GetBlob(m, &grpc.GenericServerStream[GetBlobRequest, GetBlobResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ObjectFSController_GetBlobServer = grpc.ServerStreamingServer[GetBlobResponse]
+
 // ObjectFSController_ServiceDesc is the grpc.ServiceDesc for ObjectFSController service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -583,11 +653,20 @@ var ObjectFSController_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Fsync",
 			Handler:    _ObjectFSController_Fsync_Handler,
 		},
+		{
+			MethodName: "ListBlobs",
+			Handler:    _ObjectFSController_ListBlobs_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "WatchVolume",
 			Handler:       _ObjectFSController_WatchVolume_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "GetBlob",
+			Handler:       _ObjectFSController_GetBlob_Handler,
 			ServerStreams: true,
 		},
 	},
