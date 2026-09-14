@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -239,10 +240,57 @@ func (s *Store) RefreshIndexes(ctx context.Context) error {
 				}
 			}
 			s.mu.Unlock()
+		} else {
+			baseName := strings.TrimPrefix(obj, "blobs/")
+			baseName = strings.TrimPrefix(baseName, "/")
+			if len(baseName) == 64 && !strings.Contains(baseName, ".") {
+				s.mu.Lock()
+				if _, exists := s.shaToLocation[baseName]; !exists {
+					s.shaToLocation[baseName] = BlobLocation{
+						IsStandalone: true,
+					}
+				}
+				s.mu.Unlock()
+			}
 		}
 	}
 
 	return nil
+}
+
+// ListBlobsOptions specifies filtering and pagination options for ListBlobs.
+type ListBlobsOptions struct {
+	FromSHA   string
+	Limit     int
+	SHAPrefix string
+}
+
+// ListBlobs returns the list of blob SHA256 hashes available in the store matching the given options.
+func (s *Store) ListBlobs(ctx context.Context, opts ListBlobsOptions) ([]string, bool, error) {
+	if err := s.RefreshIndexes(ctx); err != nil {
+		return nil, false, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var matching []string
+	for sha := range s.shaToLocation {
+		if opts.SHAPrefix != "" && !strings.HasPrefix(sha, opts.SHAPrefix) {
+			continue
+		}
+		if opts.FromSHA != "" && sha <= opts.FromSHA {
+			continue
+		}
+		matching = append(matching, sha)
+	}
+	sort.Strings(matching)
+
+	if opts.Limit <= 0 || len(matching) <= opts.Limit {
+		return matching, true, nil
+	}
+
+	return matching[:opts.Limit], false, nil
 }
 
 // GetBlob retrieves a blob as a ByteStream directly.

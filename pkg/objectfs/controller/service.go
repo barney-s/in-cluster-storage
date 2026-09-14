@@ -19,10 +19,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -33,6 +35,7 @@ type Server struct {
 	mu          sync.RWMutex
 	volumes     map[string]*Volume
 	backend     ObjectStorageBackend
+	blobStore   *blob.Store
 	broadcaster *EventBroadcaster
 
 	flushTicker *time.Ticker
@@ -47,6 +50,7 @@ func NewServer(backend ObjectStorageBackend) *Server {
 	return &Server{
 		volumes:     make(map[string]*Volume),
 		backend:     backend,
+		blobStore:   blob.NewStore(backend, 0),
 		broadcaster: NewEventBroadcaster(),
 	}
 }
@@ -324,4 +328,76 @@ func (s *Server) WatchVolume(req *pb.WatchVolumeRequest, stream pb.ObjectFSContr
 			}
 		}
 	}
+}
+
+func (s *Server) ListBlobs(ctx context.Context, req *pb.ListBlobsRequest) (*pb.ListBlobsResponse, error) {
+	if s.blobStore == nil {
+		return &pb.ListBlobsResponse{EndOfData: true}, nil
+	}
+	shas, endOfData, err := s.blobStore.ListBlobs(ctx, blob.ListBlobsOptions{
+		FromSHA:   req.GetFromSha(),
+		Limit:     int(req.GetLimit()),
+		SHAPrefix: req.GetShaPrefix(),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list blobs: %v", err)
+	}
+	return &pb.ListBlobsResponse{
+		Sha256:    shas,
+		EndOfData: endOfData,
+	}, nil
+}
+
+func (s *Server) GetBlob(req *pb.GetBlobRequest, stream pb.ObjectFSController_GetBlobServer) error {
+	sha := req.GetSha256()
+	if sha == "" {
+		return status.Error(codes.InvalidArgument, "sha256 is required")
+	}
+	if s.blobStore == nil {
+		return status.Errorf(codes.NotFound, "blob %s not found", sha)
+	}
+
+	offset := req.GetOffset()
+	if offset < 0 {
+		return status.Error(codes.InvalidArgument, "offset cannot be negative")
+	}
+	limit := req.GetLimit()
+	if limit < 0 {
+		return status.Error(codes.InvalidArgument, "limit cannot be negative")
+	}
+
+	bStream, err := s.blobStore.GetBlob(stream.Context(), sha)
+	if err != nil {
+		return status.Errorf(codes.NotFound, "failed to get blob: %v", err)
+	}
+	defer bStream.Close()
+
+	if offset > 0 {
+		if _, err := bStream.Seek(offset, io.SeekStart); err != nil {
+			return status.Errorf(codes.Internal, "failed seeking to offset %d: %v", offset, err)
+		}
+	}
+
+	var r io.Reader = bStream
+	if limit > 0 {
+		r = io.LimitReader(bStream, limit)
+	}
+
+	buf := make([]byte, 64*1024)
+	for {
+		n, rErr := r.Read(buf)
+		if n > 0 {
+			if err := stream.Send(&pb.GetBlobResponse{Data: buf[:n]}); err != nil {
+				return status.Errorf(codes.Internal, "failed to send blob chunk: %v", err)
+			}
+		}
+		if rErr == io.EOF {
+			break
+		}
+		if rErr != nil {
+			return status.Errorf(codes.Internal, "failed reading blob: %v", rErr)
+		}
+	}
+
+	return nil
 }

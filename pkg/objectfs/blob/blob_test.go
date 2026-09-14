@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -332,5 +333,59 @@ func TestBlobStoreOperations(t *testing.T) {
 	_ = streamRecoveredLarge.Close()
 	if !bytes.Equal(recLarge, largeData) {
 		t.Fatalf("recovered large blob mismatch: %d vs %d", len(recLarge), len(largeData))
+	}
+
+	// 4. Test ListBlobs
+	shas, endOfData, err := freshStore.ListBlobs(ctx, ListBlobsOptions{})
+	if err != nil {
+		t.Fatalf("ListBlobs failed: %v", err)
+	}
+	if !endOfData {
+		t.Fatalf("expected endOfData to be true for full list")
+	}
+	if len(shas) != 3 {
+		t.Fatalf("expected 3 blobs listed, got %d (%v)", len(shas), shas)
+	}
+	allExpected := []string{smallSHA1, smallSHA2, largeSHA}
+	sort.Strings(allExpected)
+	for i, s := range shas {
+		if s != allExpected[i] {
+			t.Fatalf("sorted list mismatch at index %d: got %s, expected %s", i, s, allExpected[i])
+		}
+	}
+
+	// 5. Test ListBlobs pagination
+	page1, endOfData1, err := freshStore.ListBlobs(ctx, ListBlobsOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListBlobs page 1 failed: %v", err)
+	}
+	if endOfData1 {
+		t.Fatalf("expected endOfData to be false for page 1")
+	}
+	if len(page1) != 2 || page1[0] != allExpected[0] || page1[1] != allExpected[1] {
+		t.Fatalf("unexpected page 1: %v", page1)
+	}
+
+	page2, endOfData2, err := freshStore.ListBlobs(ctx, ListBlobsOptions{FromSHA: page1[1], Limit: 2})
+	if err != nil {
+		t.Fatalf("ListBlobs page 2 failed: %v", err)
+	}
+	if !endOfData2 {
+		t.Fatalf("expected endOfData to be true for page 2")
+	}
+	if len(page2) != 1 || page2[0] != allExpected[2] {
+		t.Fatalf("unexpected page 2: %v", page2)
+	}
+
+	// 6. Test ListBlobs prefix
+	prefix := allExpected[0][:4]
+	prefixResults, _, err := freshStore.ListBlobs(ctx, ListBlobsOptions{SHAPrefix: prefix})
+	if err != nil {
+		t.Fatalf("ListBlobs prefix failed: %v", err)
+	}
+	for _, s := range prefixResults {
+		if !strings.HasPrefix(s, prefix) {
+			t.Fatalf("result %s does not match prefix %s", s, prefix)
+		}
 	}
 }
