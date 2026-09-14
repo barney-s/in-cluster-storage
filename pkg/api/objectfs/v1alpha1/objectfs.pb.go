@@ -1651,6 +1651,222 @@ func (x *WatchVolumeResponse) GetAttr() *EntryAttr {
 	return nil
 }
 
+type ListBlobsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	FromSha       string                 `protobuf:"bytes,1,opt,name=from_sha,json=fromSha,proto3" json:"from_sha,omitempty"`
+	Limit         int32                  `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	ShaPrefix     string                 `protobuf:"bytes,3,opt,name=sha_prefix,json=shaPrefix,proto3" json:"sha_prefix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBlobsRequest) Reset() {
+	*x = ListBlobsRequest{}
+	mi := &file_proto_objectfs_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBlobsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBlobsRequest) ProtoMessage() {}
+
+func (x *ListBlobsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBlobsRequest.ProtoReflect.Descriptor instead.
+func (*ListBlobsRequest) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *ListBlobsRequest) GetFromSha() string {
+	if x != nil {
+		return x.FromSha
+	}
+	return ""
+}
+
+func (x *ListBlobsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListBlobsRequest) GetShaPrefix() string {
+	if x != nil {
+		return x.ShaPrefix
+	}
+	return ""
+}
+
+type ListBlobsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sha256        []string               `protobuf:"bytes,1,rep,name=sha256,proto3" json:"sha256,omitempty"`
+	EndOfData     bool                   `protobuf:"varint,2,opt,name=end_of_data,json=endOfData,proto3" json:"end_of_data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBlobsResponse) Reset() {
+	*x = ListBlobsResponse{}
+	mi := &file_proto_objectfs_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBlobsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBlobsResponse) ProtoMessage() {}
+
+func (x *ListBlobsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBlobsResponse.ProtoReflect.Descriptor instead.
+func (*ListBlobsResponse) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ListBlobsResponse) GetSha256() []string {
+	if x != nil {
+		return x.Sha256
+	}
+	return nil
+}
+
+func (x *ListBlobsResponse) GetEndOfData() bool {
+	if x != nil {
+		return x.EndOfData
+	}
+	return false
+}
+
+type GetBlobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sha256        string                 `protobuf:"bytes,1,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	Offset        int64                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBlobRequest) Reset() {
+	*x = GetBlobRequest{}
+	mi := &file_proto_objectfs_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBlobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBlobRequest) ProtoMessage() {}
+
+func (x *GetBlobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBlobRequest.ProtoReflect.Descriptor instead.
+func (*GetBlobRequest) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *GetBlobRequest) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+func (x *GetBlobRequest) GetOffset() int64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *GetBlobRequest) GetLimit() int64 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type GetBlobResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBlobResponse) Reset() {
+	*x = GetBlobResponse{}
+	mi := &file_proto_objectfs_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBlobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBlobResponse) ProtoMessage() {}
+
+func (x *GetBlobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_objectfs_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBlobResponse.ProtoReflect.Descriptor instead.
+func (*GetBlobResponse) Descriptor() ([]byte, []int) {
+	return file_proto_objectfs_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *GetBlobResponse) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
 var File_proto_objectfs_proto protoreflect.FileDescriptor
 
 const file_proto_objectfs_proto_rawDesc = "" +
@@ -1753,7 +1969,21 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"event_type\x18\x01 \x01(\x0e2!.objectfs.v1alpha1.WatchEventTypeR\teventType\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x19\n" +
 	"\bold_path\x18\x03 \x01(\tR\aoldPath\x120\n" +
-	"\x04attr\x18\x04 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr*g\n" +
+	"\x04attr\x18\x04 \x01(\v2\x1c.objectfs.v1alpha1.EntryAttrR\x04attr\"b\n" +
+	"\x10ListBlobsRequest\x12\x19\n" +
+	"\bfrom_sha\x18\x01 \x01(\tR\afromSha\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x1d\n" +
+	"\n" +
+	"sha_prefix\x18\x03 \x01(\tR\tshaPrefix\"K\n" +
+	"\x11ListBlobsResponse\x12\x16\n" +
+	"\x06sha256\x18\x01 \x03(\tR\x06sha256\x12\x1e\n" +
+	"\vend_of_data\x18\x02 \x01(\bR\tendOfData\"V\n" +
+	"\x0eGetBlobRequest\x12\x16\n" +
+	"\x06sha256\x18\x01 \x01(\tR\x06sha256\x12\x16\n" +
+	"\x06offset\x18\x02 \x01(\x03R\x06offset\x12\x14\n" +
+	"\x05limit\x18\x03 \x01(\x03R\x05limit\"%\n" +
+	"\x0fGetBlobResponse\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data*g\n" +
 	"\tWriteMode\x12\x1a\n" +
 	"\x16WRITE_MODE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13WRITE_THROUGH_FSYNC\x10\x01\x12\x0e\n" +
@@ -1765,7 +1995,7 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\rEVENT_CREATED\x10\x01\x12\x12\n" +
 	"\x0eEVENT_MODIFIED\x10\x02\x12\x11\n" +
 	"\rEVENT_DELETED\x10\x03\x12\x11\n" +
-	"\rEVENT_RENAMED\x10\x042\xd2\b\n" +
+	"\rEVENT_RENAMED\x10\x042\xfe\t\n" +
 	"\x12ObjectFSController\x12P\n" +
 	"\aGetAttr\x12!.objectfs.v1alpha1.GetAttrRequest\x1a\".objectfs.v1alpha1.GetAttrResponse\x12M\n" +
 	"\x06Lookup\x12 .objectfs.v1alpha1.LookupRequest\x1a!.objectfs.v1alpha1.LookupResponse\x12P\n" +
@@ -1780,7 +2010,9 @@ const file_proto_objectfs_proto_rawDesc = "" +
 	"\x05Rmdir\x12\x1f.objectfs.v1alpha1.RmdirRequest\x1a .objectfs.v1alpha1.RmdirResponse\x12M\n" +
 	"\x06Rename\x12 .objectfs.v1alpha1.RenameRequest\x1a!.objectfs.v1alpha1.RenameResponse\x12J\n" +
 	"\x05Fsync\x12\x1f.objectfs.v1alpha1.FsyncRequest\x1a .objectfs.v1alpha1.FsyncResponse\x12^\n" +
-	"\vWatchVolume\x12%.objectfs.v1alpha1.WatchVolumeRequest\x1a&.objectfs.v1alpha1.WatchVolumeResponse0\x01BKZIgithub.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1;v1alpha1b\x06proto3"
+	"\vWatchVolume\x12%.objectfs.v1alpha1.WatchVolumeRequest\x1a&.objectfs.v1alpha1.WatchVolumeResponse0\x01\x12V\n" +
+	"\tListBlobs\x12#.objectfs.v1alpha1.ListBlobsRequest\x1a$.objectfs.v1alpha1.ListBlobsResponse\x12R\n" +
+	"\aGetBlob\x12!.objectfs.v1alpha1.GetBlobRequest\x1a\".objectfs.v1alpha1.GetBlobResponse0\x01BKZIgithub.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_objectfs_proto_rawDescOnce sync.Once
@@ -1795,7 +2027,7 @@ func file_proto_objectfs_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_objectfs_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
+var file_proto_objectfs_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_proto_objectfs_proto_goTypes = []any{
 	(WriteMode)(0),                // 0: objectfs.v1alpha1.WriteMode
 	(WatchEventType)(0),           // 1: objectfs.v1alpha1.WatchEventType
@@ -1826,17 +2058,21 @@ var file_proto_objectfs_proto_goTypes = []any{
 	(*FsyncResponse)(nil),         // 26: objectfs.v1alpha1.FsyncResponse
 	(*WatchVolumeRequest)(nil),    // 27: objectfs.v1alpha1.WatchVolumeRequest
 	(*WatchVolumeResponse)(nil),   // 28: objectfs.v1alpha1.WatchVolumeResponse
-	(*timestamppb.Timestamp)(nil), // 29: google.protobuf.Timestamp
+	(*ListBlobsRequest)(nil),      // 29: objectfs.v1alpha1.ListBlobsRequest
+	(*ListBlobsResponse)(nil),     // 30: objectfs.v1alpha1.ListBlobsResponse
+	(*GetBlobRequest)(nil),        // 31: objectfs.v1alpha1.GetBlobRequest
+	(*GetBlobResponse)(nil),       // 32: objectfs.v1alpha1.GetBlobResponse
+	(*timestamppb.Timestamp)(nil), // 33: google.protobuf.Timestamp
 }
 var file_proto_objectfs_proto_depIdxs = []int32{
-	29, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
+	33, // 0: objectfs.v1alpha1.EntryAttr.mod_time:type_name -> google.protobuf.Timestamp
 	2,  // 1: objectfs.v1alpha1.GetAttrResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 2: objectfs.v1alpha1.LookupResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 3: objectfs.v1alpha1.ReadDirResponse.entries:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 4: objectfs.v1alpha1.MkdirResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 5: objectfs.v1alpha1.CreateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	0,  // 6: objectfs.v1alpha1.WriteFileRequest.write_mode:type_name -> objectfs.v1alpha1.WriteMode
-	29, // 7: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
+	33, // 7: objectfs.v1alpha1.WriteFileResponse.mod_time:type_name -> google.protobuf.Timestamp
 	2,  // 8: objectfs.v1alpha1.TruncateFileResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	2,  // 9: objectfs.v1alpha1.RenameResponse.attr:type_name -> objectfs.v1alpha1.EntryAttr
 	1,  // 10: objectfs.v1alpha1.WatchVolumeResponse.event_type:type_name -> objectfs.v1alpha1.WatchEventType
@@ -1854,21 +2090,25 @@ var file_proto_objectfs_proto_depIdxs = []int32{
 	23, // 22: objectfs.v1alpha1.ObjectFSController.Rename:input_type -> objectfs.v1alpha1.RenameRequest
 	25, // 23: objectfs.v1alpha1.ObjectFSController.Fsync:input_type -> objectfs.v1alpha1.FsyncRequest
 	27, // 24: objectfs.v1alpha1.ObjectFSController.WatchVolume:input_type -> objectfs.v1alpha1.WatchVolumeRequest
-	4,  // 25: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
-	6,  // 26: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
-	8,  // 27: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
-	10, // 28: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
-	12, // 29: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
-	14, // 30: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
-	16, // 31: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
-	18, // 32: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
-	20, // 33: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
-	22, // 34: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
-	24, // 35: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
-	26, // 36: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
-	28, // 37: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
-	25, // [25:38] is the sub-list for method output_type
-	12, // [12:25] is the sub-list for method input_type
+	29, // 25: objectfs.v1alpha1.ObjectFSController.ListBlobs:input_type -> objectfs.v1alpha1.ListBlobsRequest
+	31, // 26: objectfs.v1alpha1.ObjectFSController.GetBlob:input_type -> objectfs.v1alpha1.GetBlobRequest
+	4,  // 27: objectfs.v1alpha1.ObjectFSController.GetAttr:output_type -> objectfs.v1alpha1.GetAttrResponse
+	6,  // 28: objectfs.v1alpha1.ObjectFSController.Lookup:output_type -> objectfs.v1alpha1.LookupResponse
+	8,  // 29: objectfs.v1alpha1.ObjectFSController.ReadDir:output_type -> objectfs.v1alpha1.ReadDirResponse
+	10, // 30: objectfs.v1alpha1.ObjectFSController.Mkdir:output_type -> objectfs.v1alpha1.MkdirResponse
+	12, // 31: objectfs.v1alpha1.ObjectFSController.CreateFile:output_type -> objectfs.v1alpha1.CreateFileResponse
+	14, // 32: objectfs.v1alpha1.ObjectFSController.ReadFile:output_type -> objectfs.v1alpha1.ReadFileResponse
+	16, // 33: objectfs.v1alpha1.ObjectFSController.WriteFile:output_type -> objectfs.v1alpha1.WriteFileResponse
+	18, // 34: objectfs.v1alpha1.ObjectFSController.TruncateFile:output_type -> objectfs.v1alpha1.TruncateFileResponse
+	20, // 35: objectfs.v1alpha1.ObjectFSController.Unlink:output_type -> objectfs.v1alpha1.UnlinkResponse
+	22, // 36: objectfs.v1alpha1.ObjectFSController.Rmdir:output_type -> objectfs.v1alpha1.RmdirResponse
+	24, // 37: objectfs.v1alpha1.ObjectFSController.Rename:output_type -> objectfs.v1alpha1.RenameResponse
+	26, // 38: objectfs.v1alpha1.ObjectFSController.Fsync:output_type -> objectfs.v1alpha1.FsyncResponse
+	28, // 39: objectfs.v1alpha1.ObjectFSController.WatchVolume:output_type -> objectfs.v1alpha1.WatchVolumeResponse
+	30, // 40: objectfs.v1alpha1.ObjectFSController.ListBlobs:output_type -> objectfs.v1alpha1.ListBlobsResponse
+	32, // 41: objectfs.v1alpha1.ObjectFSController.GetBlob:output_type -> objectfs.v1alpha1.GetBlobResponse
+	27, // [27:42] is the sub-list for method output_type
+	12, // [12:27] is the sub-list for method input_type
 	12, // [12:12] is the sub-list for extension type_name
 	12, // [12:12] is the sub-list for extension extendee
 	0,  // [0:12] is the sub-list for field type_name
@@ -1885,7 +2125,7 @@ func file_proto_objectfs_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_objectfs_proto_rawDesc), len(file_proto_objectfs_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   27,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

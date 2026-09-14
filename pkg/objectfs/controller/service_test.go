@@ -18,6 +18,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -751,5 +752,135 @@ func TestCSIControllerOperations(t *testing.T) {
 	// 7. DeleteVolume
 	if _, err := csiController.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "test-pvc-volume-1"}); err != nil {
 		t.Fatalf("DeleteVolume failed: %v", err)
+	}
+}
+
+type testGetBlobServer struct {
+	pb.ObjectFSController_GetBlobServer
+	ctx    context.Context
+	chunks [][]byte
+}
+
+func (t *testGetBlobServer) Context() context.Context {
+	return t.ctx
+}
+
+func (t *testGetBlobServer) Send(resp *pb.GetBlobResponse) error {
+	t.chunks = append(t.chunks, resp.GetData())
+	return nil
+}
+
+func TestControllerListBlobsAndGetBlob(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+	volumeID := "test-blob-vol"
+
+	content1 := []byte("blob data content number 1")
+	content2 := []byte("blob data content number 2 - slightly longer test blob")
+
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file1.txt",
+		Mode:           0644,
+		InitialContent: content1,
+	})
+	if err != nil {
+		t.Fatalf("CreateFile file1 failed: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file2.txt",
+		Mode:           0644,
+		InitialContent: content2,
+	})
+	if err != nil {
+		t.Fatalf("CreateFile file2 failed: %v", err)
+	}
+
+	// Flush volume to write blobs to blob store
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// 1. ListBlobs full
+	listResp, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{})
+	if err != nil {
+		t.Fatalf("ListBlobs failed: %v", err)
+	}
+	if len(listResp.GetSha256()) != 2 {
+		t.Fatalf("Expected 2 blobs, got %d: %v", len(listResp.GetSha256()), listResp.GetSha256())
+	}
+	if !listResp.GetEndOfData() {
+		t.Fatalf("Expected EndOfData to be true for full list")
+	}
+
+	// 2. ListBlobs pagination
+	p1, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListBlobs page 1 failed: %v", err)
+	}
+	if len(p1.GetSha256()) != 1 || p1.GetEndOfData() {
+		t.Fatalf("Expected 1 sha and EndOfData=false for page 1, got %v (EndOfData=%v)", p1.GetSha256(), p1.GetEndOfData())
+	}
+
+	p2, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{FromSha: p1.GetSha256()[0], Limit: 1})
+	if err != nil {
+		t.Fatalf("ListBlobs page 2 failed: %v", err)
+	}
+	if len(p2.GetSha256()) != 1 || !p2.GetEndOfData() {
+		t.Fatalf("Expected 1 sha and EndOfData=true for page 2, got %v (EndOfData=%v)", p2.GetSha256(), p2.GetEndOfData())
+	}
+
+	// 3. ListBlobs prefix
+	prefix := listResp.GetSha256()[0][:6]
+	prefResp, err := server.ListBlobs(ctx, &pb.ListBlobsRequest{ShaPrefix: prefix})
+	if err != nil {
+		t.Fatalf("ListBlobs prefix failed: %v", err)
+	}
+	for _, sha := range prefResp.GetSha256() {
+		if !strings.HasPrefix(sha, prefix) {
+			t.Fatalf("Expected sha %s to start with %s", sha, prefix)
+		}
+	}
+
+	// 4. GetBlob for both blobs
+	for _, sha := range listResp.GetSha256() {
+		stream := &testGetBlobServer{ctx: ctx}
+		if err := server.GetBlob(&pb.GetBlobRequest{Sha256: sha}, stream); err != nil {
+			t.Fatalf("GetBlob failed for sha %s: %v", sha, err)
+		}
+		var fullData []byte
+		for _, chunk := range stream.chunks {
+			fullData = append(fullData, chunk...)
+		}
+		if string(fullData) != string(content1) && string(fullData) != string(content2) {
+			t.Fatalf("Unexpected blob content: %q", string(fullData))
+		}
+	}
+
+	// 5. GetBlob with offset and limit
+	sha0 := listResp.GetSha256()[0]
+	streamPartial := &testGetBlobServer{ctx: ctx}
+	if err := server.GetBlob(&pb.GetBlobRequest{
+		Sha256: sha0,
+		Offset: 5,
+		Limit:  4,
+	}, streamPartial); err != nil {
+		t.Fatalf("GetBlob with offset/limit failed: %v", err)
+	}
+	var partialData []byte
+	for _, chunk := range streamPartial.chunks {
+		partialData = append(partialData, chunk...)
+	}
+	if len(partialData) != 4 {
+		t.Fatalf("Expected 4 bytes, got %d (%q)", len(partialData), string(partialData))
+	}
+
+	// 6. GetBlob for non-existent blob
+	streamNotFound := &testGetBlobServer{ctx: ctx}
+	if err := server.GetBlob(&pb.GetBlobRequest{Sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, streamNotFound); err == nil {
+		t.Fatalf("Expected error for non-existent blob, got nil")
 	}
 }

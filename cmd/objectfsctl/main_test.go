@@ -1,0 +1,288 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"google.golang.org/grpc"
+)
+
+func startTestServer(t *testing.T) (*controller.Server, string, func()) {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	backend := controller.NewMemoryBackend()
+	server := controller.NewServer(backend)
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	cleanup := func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+	}
+
+	return server, lis.Addr().String(), cleanup
+}
+
+func startTestUnixServer(t *testing.T) (*controller.Server, string, func()) {
+	t.Helper()
+
+	tempDir, err := os.MkdirTemp("", "objectfsctl-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	sockPath := filepath.Join(tempDir, "test.sock")
+
+	lis, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen on unix socket: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	backend := controller.NewMemoryBackend()
+	server := controller.NewServer(backend)
+	pb.RegisterObjectFSControllerServer(grpcServer, server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	cleanup := func() {
+		grpcServer.Stop()
+		_ = lis.Close()
+		_ = os.RemoveAll(tempDir)
+	}
+
+	return server, "unix://" + sockPath, cleanup
+}
+
+func executeCommand(args ...string) (string, error) {
+	cmd := NewRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return buf.String(), err
+}
+
+func TestBlobsListAndGet(t *testing.T) {
+	ctx := t.Context()
+	server, addr, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// 1. Missing --server flag
+	_, err := executeCommand("blobs", "list")
+	if err == nil || !strings.Contains(err.Error(), "--server is required") {
+		t.Fatalf("expected --server is required error, got: %v", err)
+	}
+
+	// 2. Empty list when no blobs exist
+	out, err := executeCommand("--server", addr, "blobs", "list")
+	if err != nil {
+		t.Fatalf("blobs list failed: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("expected empty output, got: %q", out)
+	}
+
+	// 3. Create files in a volume and flush to generate blobs
+	volumeID := "vol-test-ctl"
+	content1 := []byte("Hello World from ObjectFS Blobs!")
+	content2 := []byte("Second blob data for verifying multiple blobs in listing")
+
+	h1 := sha256.Sum256(content1)
+	sha1 := fmt.Sprintf("%x", h1)
+	h2 := sha256.Sum256(content2)
+	sha2 := fmt.Sprintf("%x", h2)
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/test1.txt",
+		InitialContent: content1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create file 1: %v", err)
+	}
+
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/test2.txt",
+		InitialContent: content2,
+	})
+	if err != nil {
+		t.Fatalf("failed to create file 2: %v", err)
+	}
+
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// 4. List blobs
+	out, err = executeCommand("--server", addr, "blobs", "list")
+	if err != nil {
+		t.Fatalf("blobs list failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 blobs in list, got %d (output: %q)", len(lines), out)
+	}
+	found := make(map[string]bool)
+	for _, l := range lines {
+		found[strings.TrimSpace(l)] = true
+	}
+	if !found[sha1] || !found[sha2] {
+		t.Fatalf("missing expected SHAs in output: %v", found)
+	}
+
+	// 5. Get blob 1
+	out1, err := executeCommand("--server", addr, "blobs", "get", sha1)
+	if err != nil {
+		t.Fatalf("blobs get %s failed: %v", sha1, err)
+	}
+	if out1 != string(content1) {
+		t.Fatalf("blob 1 content mismatch: got %q, expected %q", out1, string(content1))
+	}
+
+	// Verify sha256 of downloaded content
+	outH1 := sha256.Sum256([]byte(out1))
+	if fmt.Sprintf("%x", outH1) != sha1 {
+		t.Fatalf("downloaded content SHA mismatch: got %x, expected %s", outH1, sha1)
+	}
+
+	// 6. Get blob 2
+	out2, err := executeCommand("--server", addr, "blobs", "get", sha2)
+	if err != nil {
+		t.Fatalf("blobs get %s failed: %v", sha2, err)
+	}
+	if out2 != string(content2) {
+		t.Fatalf("blob 2 content mismatch: got %q, expected %q", out2, string(content2))
+	}
+
+	// 7. Get non-existent blob
+	_, err = executeCommand("--server", addr, "blobs", "get", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+	if err == nil {
+		t.Fatalf("expected error for non-existent blob, got nil")
+	}
+
+	// 8. Missing arg for get
+	_, err = executeCommand("--server", addr, "blobs", "get")
+	if err == nil {
+		t.Fatalf("expected error for missing get argument, got nil")
+	}
+
+	// 9. Blobs list with --limit
+	limOut, err := executeCommand("--server", addr, "blobs", "list", "--limit", "1")
+	if err != nil {
+		t.Fatalf("blobs list --limit 1 failed: %v", err)
+	}
+	limLines := strings.Split(strings.TrimSpace(limOut), "\n")
+	if len(limLines) != 1 {
+		t.Fatalf("expected 1 blob with --limit 1, got %d (output: %q)", len(limLines), limOut)
+	}
+
+	// 10. Blobs list with --from
+	fromOut, err := executeCommand("--server", addr, "blobs", "list", "--from", limLines[0])
+	if err != nil {
+		t.Fatalf("blobs list --from failed: %v", err)
+	}
+	fromLines := strings.Split(strings.TrimSpace(fromOut), "\n")
+	if len(fromLines) != 1 {
+		t.Fatalf("expected 1 blob with --from, got %d (output: %q)", len(fromLines), fromOut)
+	}
+
+	// 11. Blobs list with --prefix
+	pref := sha1[:4]
+	prefOut, err := executeCommand("--server", addr, "blobs", "list", "--prefix", pref)
+	if err != nil {
+		t.Fatalf("blobs list --prefix failed: %v", err)
+	}
+	for _, l := range strings.Split(strings.TrimSpace(prefOut), "\n") {
+		if l != "" && !strings.HasPrefix(l, pref) {
+			t.Fatalf("expected line %s to have prefix %s", l, pref)
+		}
+	}
+
+	// 12. Blobs get with --offset and --limit
+	partialOut, err := executeCommand("--server", addr, "blobs", "get", sha1, "--offset", "6", "--limit", "5")
+	if err != nil {
+		t.Fatalf("blobs get with offset/limit failed: %v", err)
+	}
+	if partialOut != "World" {
+		t.Fatalf("expected %q, got %q", "World", partialOut)
+	}
+}
+
+func TestBlobsOverUnixSocket(t *testing.T) {
+	ctx := t.Context()
+	server, unixAddr, cleanup := startTestUnixServer(t)
+	defer cleanup()
+
+	volumeID := "unix-vol"
+	content := []byte("Testing objectfsctl over Unix domain socket")
+	h := sha256.Sum256(content)
+	sha := fmt.Sprintf("%x", h)
+
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/unix_file.txt",
+		InitialContent: content,
+	})
+	if err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+
+	// Test blobs list
+	out, err := executeCommand("--server", unixAddr, "blobs", "list")
+	if err != nil {
+		t.Fatalf("blobs list failed over unix socket: %v", err)
+	}
+	if !strings.Contains(out, sha) {
+		t.Fatalf("expected %s in output %q", sha, out)
+	}
+
+	// Test blobs get
+	getOut, err := executeCommand("--server", unixAddr, "blobs", "get", sha)
+	if err != nil {
+		t.Fatalf("blobs get failed over unix socket: %v", err)
+	}
+	if getOut != string(content) {
+		t.Fatalf("mismatch: got %q, expected %q", getOut, string(content))
+	}
+}

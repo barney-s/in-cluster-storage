@@ -34,6 +34,8 @@ service ObjectFSController {
   rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Fsync(FsyncRequest) returns (FsyncResponse);
   rpc WatchVolume(WatchVolumeRequest) returns (stream WatchVolumeResponse);
+  rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
+  rpc GetBlob(GetBlobRequest) returns (stream GetBlobResponse);
 }
 
 enum WriteMode {
@@ -198,3 +200,25 @@ message WatchVolumeResponse {
   string old_path = 3;
   EntryAttr attr = 4;
 }
+
+message ListBlobsRequest {
+  string from_sha = 1;
+  int32 limit = 2;
+  string sha_prefix = 3;
+}
+
+message ListBlobsResponse {
+  repeated string sha256 = 1;
+  bool end_of_data = 2;
+}
+
+message GetBlobRequest {
+  string sha256 = 1;
+  int64 offset = 2;
+  int64 limit = 3;
+}
+
+message GetBlobResponse {
+  bytes data = 1;
+}
+
