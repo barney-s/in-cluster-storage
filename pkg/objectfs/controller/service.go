@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,18 +136,6 @@ func (s *Server) StopPeriodicFlush() {
 // GetVolume returns the Volume instance for the given volumeID.
 func (s *Server) GetVolume(volumeID string) *Volume {
 	return s.getOrCreateVolume(volumeID)
-}
-
-// CreateSnapshot triggers a backend flush and creates an EROFS snapshot for the volume.
-func (s *Server) CreateSnapshot(ctx context.Context, volumeID string) (string, error) {
-	vol := s.getOrCreateVolume(volumeID)
-	return vol.CreateSnapshot(ctx)
-}
-
-// ListSnapshots returns all EROFS snapshot filenames for the volume.
-func (s *Server) ListSnapshots(ctx context.Context, volumeID string) ([]string, error) {
-	vol := s.getOrCreateVolume(volumeID)
-	return vol.ListSnapshots(ctx)
 }
 
 // RestoreSnapshot restores the volume filesystem state to a specific EROFS snapshot.
@@ -400,4 +390,165 @@ func (s *Server) GetBlob(req *pb.GetBlobRequest, stream pb.ObjectFSController_Ge
 	}
 
 	return nil
+}
+
+func parseSnapshotTime(name string) time.Time {
+	trimmed := strings.TrimSuffix(name, ".erofs")
+	formats := []string{
+		"20060102T150405.000000Z",
+		"20060102T150405Z",
+		time.RFC3339Nano,
+		time.RFC3339,
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, trimmed); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func (s *Server) ListVolumes(ctx context.Context, req *pb.ListVolumesRequest) (*pb.ListVolumesResponse, error) {
+	volMap := make(map[string]struct{})
+
+	s.mu.RLock()
+	for id := range s.volumes {
+		volMap[id] = struct{}{}
+	}
+	s.mu.RUnlock()
+
+	if s.backend != nil {
+		objects, err := s.backend.ListObjects(ctx, "", "volumes/")
+		if err == nil {
+			for _, obj := range objects {
+				trimmed := strings.TrimPrefix(obj, "volumes/")
+				parts := strings.Split(trimmed, "/")
+				if len(parts) > 0 && parts[0] != "" {
+					volMap[parts[0]] = struct{}{}
+				}
+			}
+		}
+	}
+
+	var allVols []string
+	for id := range volMap {
+		allVols = append(allVols, id)
+	}
+	sort.Strings(allVols)
+
+	fromVolumeID := ""
+	limit := 0
+	if req != nil {
+		fromVolumeID = req.GetFromVolumeId()
+		limit = int(req.GetLimit())
+	}
+
+	var filtered []string
+	for _, id := range allVols {
+		if fromVolumeID != "" && id <= fromVolumeID {
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+
+	endOfData := true
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[:limit]
+		endOfData = false
+	}
+
+	var volInfos []*pb.VolumeInfo
+	for _, id := range filtered {
+		volInfos = append(volInfos, &pb.VolumeInfo{
+			VolumeId: id,
+		})
+	}
+
+	return &pb.ListVolumesResponse{
+		Volumes:   volInfos,
+		EndOfData: endOfData,
+	}, nil
+}
+
+func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest) (*pb.ListSnapshotsResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol := s.getOrCreateVolume(req.GetVolumeId())
+	allSnapshots, err := vol.ListSnapshots(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list snapshots: %v", err)
+	}
+
+	var fromTime, toTime time.Time
+	if req.GetFromTime() != nil {
+		fromTime = req.GetFromTime().AsTime()
+	}
+	if req.GetToTime() != nil {
+		toTime = req.GetToTime().AsTime()
+	}
+	fromSnapshot := req.GetFromSnapshot()
+
+	var filtered []string
+	for _, snap := range allSnapshots {
+		if fromSnapshot != "" && snap <= fromSnapshot {
+			continue
+		}
+		snapTime := parseSnapshotTime(snap)
+		if !fromTime.IsZero() && !snapTime.IsZero() && snapTime.Before(fromTime) {
+			continue
+		}
+		if !toTime.IsZero() && !snapTime.IsZero() && snapTime.After(toTime) {
+			continue
+		}
+		filtered = append(filtered, snap)
+	}
+
+	limit := int(req.GetLimit())
+	endOfData := true
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[:limit]
+		endOfData = false
+	}
+
+	var snapInfos []*pb.SnapshotInfo
+	for _, snap := range filtered {
+		info := &pb.SnapshotInfo{
+			Name: snap,
+		}
+		t := parseSnapshotTime(snap)
+		if !t.IsZero() {
+			info.CreatedAt = timestamppb.New(t)
+		}
+		snapInfos = append(snapInfos, info)
+	}
+
+	return &pb.ListSnapshotsResponse{
+		Snapshots: snapInfos,
+		EndOfData: endOfData,
+	}, nil
+}
+
+func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotRequest) (*pb.CreateSnapshotResponse, error) {
+	if req.GetVolumeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	vol := s.getOrCreateVolume(req.GetVolumeId())
+	snapName, err := vol.CreateSnapshot(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create snapshot: %v", err)
+	}
+
+	snapInfo := &pb.SnapshotInfo{
+		Name: snapName,
+	}
+	t := parseSnapshotTime(snapName)
+	if !t.IsZero() {
+		snapInfo.CreatedAt = timestamppb.New(t)
+	}
+
+	return &pb.CreateSnapshotResponse{
+		SnapshotName: snapName,
+		Snapshot:     snapInfo,
+	}, nil
 }

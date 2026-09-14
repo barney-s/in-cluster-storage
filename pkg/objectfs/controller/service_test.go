@@ -475,10 +475,13 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 	}
 
 	// Create snapshot
-	snapName, err := server.CreateSnapshot(ctx, volumeID)
+	snapResp, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{
+		VolumeId: volumeID,
+	})
 	if err != nil {
 		t.Fatalf("CreateSnapshot failed: %v", err)
 	}
+	snapName := snapResp.GetSnapshotName()
 	if snapName == "" || !strings.HasSuffix(snapName, ".erofs") {
 		t.Fatalf("Expected .erofs snapshot name, got: %s", snapName)
 	}
@@ -500,12 +503,14 @@ func TestErofsSnapshotCreationAndRecovery(t *testing.T) {
 	}
 
 	// 3. List snapshots returns the snapshot
-	snapshots, err := server.ListSnapshots(ctx, volumeID)
+	listResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{
+		VolumeId: volumeID,
+	})
 	if err != nil {
 		t.Fatalf("ListSnapshots failed: %v", err)
 	}
-	if len(snapshots) != 1 || snapshots[0] != snapName {
-		t.Fatalf("Expected snapshots [%s], got %v", snapName, snapshots)
+	if len(listResp.GetSnapshots()) != 1 || listResp.GetSnapshots()[0].GetName() != snapName {
+		t.Fatalf("Expected snapshots [%s], got %v", snapName, listResp.GetSnapshots())
 	}
 
 	// 4. Test Recovery on a new Server instance using only the backend
@@ -568,10 +573,13 @@ func TestErofsSnapshotRollback(t *testing.T) {
 		t.Fatalf("CreateFile failed: %v", err)
 	}
 
-	snap1, err := server.CreateSnapshot(ctx, volumeID)
+	snapResp1, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{
+		VolumeId: volumeID,
+	})
 	if err != nil {
 		t.Fatalf("CreateSnapshot 1 failed: %v", err)
 	}
+	snap1 := snapResp1.GetSnapshotName()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -596,18 +604,23 @@ func TestErofsSnapshotRollback(t *testing.T) {
 		t.Fatalf("CreateFile doc2 failed: %v", err)
 	}
 
-	snap2, err := server.CreateSnapshot(ctx, volumeID)
+	snapResp2, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{
+		VolumeId: volumeID,
+	})
 	if err != nil {
 		t.Fatalf("CreateSnapshot 2 failed: %v", err)
 	}
+	snap2 := snapResp2.GetSnapshotName()
 
 	// Verify 2 snapshots listed
-	snapshots, err := server.ListSnapshots(ctx, volumeID)
+	listResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{
+		VolumeId: volumeID,
+	})
 	if err != nil {
 		t.Fatalf("ListSnapshots failed: %v", err)
 	}
-	if len(snapshots) < 2 {
-		t.Fatalf("Expected at least 2 snapshots, got %d", len(snapshots))
+	if len(listResp.GetSnapshots()) < 2 {
+		t.Fatalf("Expected at least 2 snapshots, got %d", len(listResp.GetSnapshots()))
 	}
 
 	// Roll back to snap1
@@ -882,5 +895,210 @@ func TestControllerListBlobsAndGetBlob(t *testing.T) {
 	streamNotFound := &testGetBlobServer{ctx: ctx}
 	if err := server.GetBlob(&pb.GetBlobRequest{Sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, streamNotFound); err == nil {
 		t.Fatalf("Expected error for non-existent blob, got nil")
+	}
+}
+
+func TestListVolumes(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+
+	// 1. Empty server returns empty list
+	resp, err := server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("ListVolumes failed: %v", err)
+	}
+	if len(resp.GetVolumes()) != 0 || !resp.GetEndOfData() {
+		t.Fatalf("Expected 0 volumes, got %v", resp.GetVolumes())
+	}
+
+	// 2. Create files in 3 volumes
+	volNames := []string{"vol-c", "vol-a", "vol-b"}
+	for _, v := range volNames {
+		_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+			VolumeId:       v,
+			Path:           "/hello.txt",
+			InitialContent: []byte("content for " + v),
+		})
+		if err != nil {
+			t.Fatalf("CreateFile for %s failed: %v", v, err)
+		}
+	}
+
+	// 3. List all volumes (should be sorted alphabetically: vol-a, vol-b, vol-c)
+	resp, err = server.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("ListVolumes failed: %v", err)
+	}
+	if len(resp.GetVolumes()) != 3 {
+		t.Fatalf("Expected 3 volumes, got %d", len(resp.GetVolumes()))
+	}
+	expected := []string{"vol-a", "vol-b", "vol-c"}
+	for i, exp := range expected {
+		if resp.GetVolumes()[i].GetVolumeId() != exp {
+			t.Fatalf("Index %d: expected %s, got %s", i, exp, resp.GetVolumes()[i].GetVolumeId())
+		}
+	}
+
+	// 4. List with pagination (limit 2)
+	resp, err = server.ListVolumes(ctx, &pb.ListVolumesRequest{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListVolumes with limit failed: %v", err)
+	}
+	if len(resp.GetVolumes()) != 2 || resp.GetEndOfData() {
+		t.Fatalf("Expected 2 volumes and EndOfData=false, got %d volumes, EndOfData=%v", len(resp.GetVolumes()), resp.GetEndOfData())
+	}
+
+	// 5. List with from_volume_id
+	resp, err = server.ListVolumes(ctx, &pb.ListVolumesRequest{FromVolumeId: "vol-a"})
+	if err != nil {
+		t.Fatalf("ListVolumes with FromVolumeId failed: %v", err)
+	}
+	if len(resp.GetVolumes()) != 2 || resp.GetVolumes()[0].GetVolumeId() != "vol-b" || resp.GetVolumes()[1].GetVolumeId() != "vol-c" {
+		t.Fatalf("Unexpected volumes after vol-a: %v", resp.GetVolumes())
+	}
+
+	// 6. Flush vol-a and check backend discovery with a fresh Server instance
+	if err := server.FlushAll(ctx); err != nil {
+		t.Fatalf("FlushAll failed: %v", err)
+	}
+	recoveredServer := NewServer(backend)
+	recResp, err := recoveredServer.ListVolumes(ctx, &pb.ListVolumesRequest{})
+	if err != nil {
+		t.Fatalf("recovered server ListVolumes failed: %v", err)
+	}
+	if len(recResp.GetVolumes()) != 3 {
+		t.Fatalf("Expected 3 volumes discovered in backend, got %d: %v", len(recResp.GetVolumes()), recResp.GetVolumes())
+	}
+}
+
+func TestSnapshotsServicePagination(t *testing.T) {
+	ctx := t.Context()
+	backend := NewMemoryBackend()
+	server := NewServer(backend)
+
+	// 1. Validation errors
+	if _, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{}); err == nil {
+		t.Fatalf("Expected error for empty volume_id on CreateSnapshot")
+	}
+	if _, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{}); err == nil {
+		t.Fatalf("Expected error for empty volume_id on ListSnapshots")
+	}
+
+	volumeID := "test-snap-pag"
+
+	// 2. Create snapshot 1
+	_, err := server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file1.txt",
+		InitialContent: []byte("snap 1 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile 1 failed: %v", err)
+	}
+
+	snapResp1, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot 1 failed: %v", err)
+	}
+	snap1 := snapResp1.GetSnapshotName()
+	if snapResp1.GetSnapshot().GetCreatedAt() == nil {
+		t.Fatalf("Expected non-nil CreatedAt in SnapshotInfo")
+	}
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Create snapshot 2
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file2.txt",
+		InitialContent: []byte("snap 2 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile 2 failed: %v", err)
+	}
+
+	snapResp2, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot 2 failed: %v", err)
+	}
+	snap2 := snapResp2.GetSnapshotName()
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Create snapshot 3
+	_, err = server.CreateFile(ctx, &pb.CreateFileRequest{
+		VolumeId:       volumeID,
+		Path:           "/file3.txt",
+		InitialContent: []byte("snap 3 content"),
+	})
+	if err != nil {
+		t.Fatalf("CreateFile 3 failed: %v", err)
+	}
+
+	snapResp3, err := server.CreateSnapshot(ctx, &pb.CreateSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("CreateSnapshot 3 failed: %v", err)
+	}
+	snap3 := snapResp3.GetSnapshotName()
+
+	// 3. List all 3
+	listResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("ListSnapshots failed: %v", err)
+	}
+	if len(listResp.GetSnapshots()) != 3 || !listResp.GetEndOfData() {
+		t.Fatalf("Expected 3 snapshots, got %d (endOfData=%v)", len(listResp.GetSnapshots()), listResp.GetEndOfData())
+	}
+	if listResp.GetSnapshots()[0].GetName() != snap1 ||
+		listResp.GetSnapshots()[1].GetName() != snap2 ||
+		listResp.GetSnapshots()[2].GetName() != snap3 {
+		t.Fatalf("Snapshots not in chronological order: %v", listResp.GetSnapshots())
+	}
+
+	// 4. List with Limit: 2
+	limResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VolumeId: volumeID, Limit: 2})
+	if err != nil {
+		t.Fatalf("ListSnapshots with limit failed: %v", err)
+	}
+	if len(limResp.GetSnapshots()) != 2 || limResp.GetEndOfData() {
+		t.Fatalf("Expected 2 snapshots with EndOfData=false, got %d (endOfData=%v)", len(limResp.GetSnapshots()), limResp.GetEndOfData())
+	}
+
+	// 5. List with FromSnapshot
+	cursorResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{
+		VolumeId:     volumeID,
+		FromSnapshot: snap1,
+	})
+	if err != nil {
+		t.Fatalf("ListSnapshots with FromSnapshot failed: %v", err)
+	}
+	if len(cursorResp.GetSnapshots()) != 2 || cursorResp.GetSnapshots()[0].GetName() != snap2 || cursorResp.GetSnapshots()[1].GetName() != snap3 {
+		t.Fatalf("Unexpected snapshots after snap1: %v", cursorResp.GetSnapshots())
+	}
+
+	// 6. List with FromTime (using snap2 timestamp)
+	t2 := snapResp2.GetSnapshot().GetCreatedAt()
+	fromTimeResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{
+		VolumeId: volumeID,
+		FromTime: t2,
+	})
+	if err != nil {
+		t.Fatalf("ListSnapshots with FromTime failed: %v", err)
+	}
+	if len(fromTimeResp.GetSnapshots()) < 2 {
+		t.Fatalf("Expected at least 2 snapshots from snap2 onwards, got %d", len(fromTimeResp.GetSnapshots()))
+	}
+
+	// 7. List with ToTime (using snap2 timestamp)
+	toTimeResp, err := server.ListSnapshots(ctx, &pb.ListSnapshotsRequest{
+		VolumeId: volumeID,
+		ToTime:   t2,
+	})
+	if err != nil {
+		t.Fatalf("ListSnapshots with ToTime failed: %v", err)
+	}
+	if len(toTimeResp.GetSnapshots()) < 2 {
+		t.Fatalf("Expected at least 2 snapshots up to snap2, got %d", len(toTimeResp.GetSnapshots()))
 	}
 }
