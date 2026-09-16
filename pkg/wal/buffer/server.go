@@ -68,8 +68,19 @@ type ackResult struct {
 }
 
 type streamState struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
 	witnessSeq uint64
 	s3Seq      uint64
+}
+
+func newStreamState(witnessSeq, s3Seq uint64) *streamState {
+	st := &streamState{
+		witnessSeq: witnessSeq,
+		s3Seq:      s3Seq,
+	}
+	st.cond = sync.NewCond(&st.mu)
+	return st
 }
 
 // Server implements the WalBuffer gRPC service.
@@ -186,10 +197,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	// Populate initial streams state from manifest
 	for sid, st := range m.Streams {
-		s.streams[sid] = &streamState{
-			witnessSeq: st.S3AckedStreamSeq,
-			s3Seq:      st.S3AckedStreamSeq,
-		}
+		s.streams[sid] = newStreamState(st.S3AckedStreamSeq, st.S3AckedStreamSeq)
 	}
 
 	// Start background group commit worker
@@ -208,6 +216,15 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 // Close gracefully stops workers, flushes to permanent storage, and closes local stores.
 func (s *Server) Close() error {
 	close(s.stopChan)
+	// Wake any stream Append notification forwarders waiting on st.cond so they
+	// observe s.stopChan closure and exit their goroutine.
+	s.mu.RLock()
+	for _, st := range s.streams {
+		st.mu.Lock()
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}
+	s.mu.RUnlock()
 	s.wg.Wait()
 
 	var errs []error
@@ -253,10 +270,7 @@ func (s *Server) getOrCreateStream(streamID uuid.UUID) *streamState {
 	sid := streamID.String()
 	st, exists := s.streams[sid]
 	if !exists {
-		st = &streamState{
-			witnessSeq: 0,
-			s3Seq:      0,
-		}
+		st = newStreamState(0, 0)
 		s.streams[sid] = st
 	}
 	return st
@@ -284,10 +298,10 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 
 	st := s.getOrCreateStream(streamID)
 
-	s.mu.RLock()
+	st.mu.Lock()
 	witnessSeq := st.witnessSeq
 	s3Seq := st.s3Seq
-	s.mu.RUnlock()
+	st.mu.Unlock()
 
 	// Deduped / single sender channel to prevent concurrent stream.Send calls
 	outCh := make(chan *pb.AppendResponse, 64)
@@ -331,36 +345,54 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 		return status.Errorf(codes.Unavailable, "server shutting down")
 	}
 
-	// Create channel for S3 acks notifications for this client
-	s3NotifyCh := make(chan struct{}, 10)
-	s.registerS3AckWaiter(s3NotifyCh)
-	defer s.unregisterS3AckWaiter(s3NotifyCh)
+	// Wake the S3 ack forwarding goroutine on context cancellation or stream return so it can exit.
+	stopCtxWatcher := context.AfterFunc(ctx, func() {
+		st.mu.Lock()
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	})
+	defer stopCtxWatcher()
+	defer func() {
+		st.mu.Lock()
+		st.cond.Broadcast()
+		st.mu.Unlock()
+	}()
 
 	// Forward S3 acks notifications to outCh
 	go func() {
+		lastAckedS3 := s3Seq
 		for {
+			st.mu.Lock()
+			for st.s3Seq <= lastAckedS3 {
+				select {
+				case <-ctx.Done():
+					st.mu.Unlock()
+					return
+				case <-s.stopChan:
+					st.mu.Unlock()
+					return
+				default:
+				}
+				st.cond.Wait()
+			}
+			curWitness := st.witnessSeq
+			curS3 := st.s3Seq
+			lastAckedS3 = curS3
+			st.mu.Unlock()
+
 			select {
 			case <-ctx.Done():
 				return
 			case <-s.stopChan:
 				return
-			case <-s3NotifyCh:
-				s.mu.RLock()
-				curWitness := st.witnessSeq
-				curS3 := st.s3Seq
-				s.mu.RUnlock()
-
-				select {
-				case outCh <- &pb.AppendResponse{
-					Msg: &pb.AppendResponse_Ack{
-						Ack: &pb.Ack{
-							WitnessAckedStreamSeq: curWitness,
-							S3AckedStreamSeq:      curS3,
-						},
+			case outCh <- &pb.AppendResponse{
+				Msg: &pb.AppendResponse_Ack{
+					Ack: &pb.Ack{
+						WitnessAckedStreamSeq: curWitness,
+						S3AckedStreamSeq:      curS3,
 					},
-				}:
-				default:
-				}
+				},
+			}:
 			}
 		}
 	}()
@@ -380,10 +412,10 @@ func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
 			continue
 		}
 
-		s.mu.RLock()
+		st.mu.Lock()
 		curWitness := st.witnessSeq
 		curS3 := st.s3Seq
-		s.mu.RUnlock()
+		st.mu.Unlock()
 
 		// Idempotency: duplicate records at or below witness watermark are acked and dropped
 		if pbRec.StreamSeq <= curWitness {
@@ -557,20 +589,24 @@ func (s *Server) commitItems(items []incomingItem) {
 		sid := rec.StreamID.String()
 		st := s.streams[sid]
 		if st == nil {
-			st = &streamState{
-				witnessSeq: rec.StreamSeq,
-				s3Seq:      0,
-			}
+			st = newStreamState(rec.StreamSeq, 0)
 			s.streams[sid] = st
 		} else {
+			st.mu.Lock()
 			if rec.StreamSeq > st.witnessSeq {
 				st.witnessSeq = rec.StreamSeq
 			}
+			st.mu.Unlock()
 		}
 
+		st.mu.Lock()
+		wSeq := st.witnessSeq
+		sSeq := st.s3Seq
+		st.mu.Unlock()
+
 		item.ackChan <- ackResult{
-			witnessSeq: st.witnessSeq,
-			s3Seq:      st.s3Seq,
+			witnessSeq: wSeq,
+			s3Seq:      sSeq,
 		}
 	}
 
@@ -714,12 +750,16 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		s.manifest.PositionFloor = newFloor
 	}
 
+	var notifiedStreams []*streamState
 	for sid, maxSeq := range streamMaxSeq {
 		s.manifest.Streams[sid] = StreamState{S3AckedStreamSeq: maxSeq}
 		if st, exists := s.streams[sid]; exists {
+			st.mu.Lock()
 			if maxSeq > st.s3Seq {
 				st.s3Seq = maxSeq
+				notifiedStreams = append(notifiedStreams, st)
 			}
+			st.mu.Unlock()
 		}
 	}
 
@@ -743,44 +783,13 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		klog.Warningf("Error cleaning local segment files: %v", err)
 	}
 
-	// 6. Broadcast S3 acks advance
-	s.broadcastS3Ack()
+	// 6. Notify streams whose S3 acks advanced
+	for _, st := range notifiedStreams {
+		st.cond.Broadcast()
+	}
 
 	klog.Infof("Flushed WAL segment %s (%d records, %d bytes) to permanent storage", segPath, len(records), segBuf.Len())
 	return nil
-}
-
-type s3AckRegistry struct {
-	mu      sync.Mutex
-	waiters map[chan struct{}]struct{}
-}
-
-var globalS3AckRegistry = s3AckRegistry{
-	waiters: make(map[chan struct{}]struct{}),
-}
-
-func (s *Server) registerS3AckWaiter(ch chan struct{}) {
-	globalS3AckRegistry.mu.Lock()
-	globalS3AckRegistry.waiters[ch] = struct{}{}
-	globalS3AckRegistry.mu.Unlock()
-}
-
-func (s *Server) unregisterS3AckWaiter(ch chan struct{}) {
-	globalS3AckRegistry.mu.Lock()
-	delete(globalS3AckRegistry.waiters, ch)
-	globalS3AckRegistry.mu.Unlock()
-}
-
-func (s *Server) broadcastS3Ack() {
-	globalS3AckRegistry.mu.Lock()
-	defer globalS3AckRegistry.mu.Unlock()
-
-	for ch := range globalS3AckRegistry.waiters {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
 }
 
 // Tail streams merged records in position order from object storage, local disk, and live incoming commits.
