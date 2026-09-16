@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/container-storage-interface/spec v1.13.0
 	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260531174830-a88711ea19d3
+	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.48.0
