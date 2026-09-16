@@ -23,9 +23,11 @@ service WalBuffer {
   rpc Append(stream AppendRequest) returns (stream AppendResponse);
   // Force a flush to permanent object storage now. Returns once the manifest is written.
   rpc Flush(FlushRequest) returns (FlushResponse);
-  // Read merged records in position order. Position is unique and strictly increasing for the life of the log.
-  // Note: a record may appear under two positions if the witness restarted between witness ack and permanent ack;
-  // consumers must deduplicate on (stream_id, stream_seq).
+  // Read merged records in position order. Positions are strictly increasing within a witness incarnation;
+  // positions above the last flushed position (manifest.last_position) are provisional and may be reassigned
+  // after a restart. Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning
+  // the effective start in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq)
+  // and must tolerate re-delivery from the last flushed position after reconnecting.
   rpc Tail(TailRequest) returns (stream TailResponse);
 }
 
@@ -84,4 +86,5 @@ message LogRecord {
 
 message TailResponse {
   LogRecord record = 1;
+  uint64 resumed_from = 2;
 }

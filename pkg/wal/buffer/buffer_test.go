@@ -17,6 +17,7 @@ limitations under the License.
 package buffer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -69,35 +70,22 @@ func startTestServer(t *testing.T, backend blob.ObjectStorageBackend, dataDir st
 	return srv, listener.Addr().String(), cleanup
 }
 
-func TestServerStartupAndPositionReservation(t *testing.T) {
-	backend := controller.NewMemoryBackend()
-	dataDir := t.TempDir()
-
-	// 1. Initial startup on empty backend
-	srv1, _, cleanup1 := startTestServer(t, backend, dataDir)
-	if srv1.PositionFloor() != PositionFloorStep {
-		t.Errorf("expected initial position_floor %d, got %d", PositionFloorStep, srv1.PositionFloor())
-	}
-	cleanup1()
-
-	// 2. Second startup should advance position_floor by PositionFloorStep
-	srv2, _, cleanup2 := startTestServer(t, backend, t.TempDir())
-	if srv2.PositionFloor() != PositionFloorStep*2 {
-		t.Errorf("expected second position_floor %d, got %d", PositionFloorStep*2, srv2.PositionFloor())
-	}
-	cleanup2()
-}
-
-func TestFloorBumpOnFlush(t *testing.T) {
+func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 	backend := controller.NewMemoryBackend()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
 
-	// Artificially advance lastPosition to within FloorBumpThreshold of PositionFloor
-	srv.mu.Lock()
-	srv.lastPosition = srv.positionFloor - 100
-	srv.mu.Unlock()
+	if srv.LastPosition() != 0 {
+		t.Errorf("expected initial lastPosition 0, got %d", srv.LastPosition())
+	}
 
+	// Verify manifest is NOT created in backend on startup
+	var buf bytes.Buffer
+	if err := backend.GetObject(t.Context(), "", ManifestKey, 0, 0, &buf); err == nil {
+		t.Fatalf("expected manifest to not exist on startup, but GetObject succeeded")
+	}
+
+	// Append a record and flush
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -114,51 +102,25 @@ func TestFloorBumpOnFlush(t *testing.T) {
 	_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID[:]}}})
 	_, _ = stream.Recv()
 
-	// Send a record
 	_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 1, Payload: []byte("test")}}})
 	_, _ = stream.Recv()
 
-	initialFloor := srv.PositionFloor()
-
-	// Flush
 	_, err = client.Flush(t.Context(), &pb.FlushRequest{})
 	if err != nil {
 		t.Fatalf("flush failed: %v", err)
 	}
 
-	if srv.PositionFloor() <= initialFloor {
-		t.Errorf("expected position_floor to bump on flush (initial=%d, current=%d)", initialFloor, srv.PositionFloor())
+	// Verify manifest now exists in backend
+	buf.Reset()
+	if err := backend.GetObject(t.Context(), "", ManifestKey, 0, 0, &buf); err != nil {
+		t.Fatalf("expected manifest to exist after flush: %v", err)
 	}
 }
 
-// faultyBackend wraps MemoryBackend and injects errors on PutObject for specific keys.
-type faultyBackend struct {
-	*controller.MemoryBackend
-	failManifestPut bool
-}
-
-func (b *faultyBackend) PutObject(ctx context.Context, volumeID, key string, stream blob.ByteStream) (string, error) {
-	if b.failManifestPut && key == ManifestKey {
-		_ = stream.Close()
-		return "", errors.New("injected PutObject error for manifest")
-	}
-	return b.MemoryBackend.PutObject(ctx, volumeID, key, stream)
-}
-
-func TestFloorBumpDurableAfterManifestSave(t *testing.T) {
-	memBackend := controller.NewMemoryBackend()
-	fb := &faultyBackend{
-		MemoryBackend: memBackend,
-	}
-
-	srv, addr, cleanup := startTestServer(t, fb, t.TempDir())
+func TestTailClampingAndResumedFrom(t *testing.T) {
+	backend := controller.NewMemoryBackend()
+	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
-
-	// Artificially advance lastPosition to within FloorBumpThreshold of PositionFloor
-	srv.mu.Lock()
-	srv.lastPosition = srv.positionFloor - 100
-	initialFloor := srv.positionFloor
-	srv.mu.Unlock()
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -176,22 +138,79 @@ func TestFloorBumpDurableAfterManifestSave(t *testing.T) {
 	_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID[:]}}})
 	_, _ = stream.Recv()
 
-	_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 1, Payload: []byte("test")}}})
-	_, _ = stream.Recv()
+	// Append 5 records and flush (positions 1..5, manifest.last_position = 5)
+	for i := uint64(1); i <= 5; i++ {
+		_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("rec-%d", i))}}})
+		_, _ = stream.Recv()
+	}
 
-	// Inject manifest failure
-	fb.failManifestPut = true
-
-	// Attempt flush - should fail
 	_, err = client.Flush(t.Context(), &pb.FlushRequest{})
-	if err == nil {
-		t.Fatalf("expected flush to fail due to injected manifest error")
+	if err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 
-	// Verify in-memory position floor was NOT bumped
-	if srv.PositionFloor() != initialFloor {
-		t.Errorf("expected position_floor to remain %d on failed manifest save, got %d", initialFloor, srv.PositionFloor())
+	// Append 3 more records (unflushed, provisional positions 6..8)
+	for i := uint64(6); i <= 8; i++ {
+		_ = stream.Send(&pb.AppendRequest{Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: i, Payload: []byte(fmt.Sprintf("rec-%d", i))}}})
+		_, _ = stream.Recv()
 	}
+
+	// 1. Tail from position 1 (<= last_position + 1)
+	tailStream1, err := client.Tail(t.Context(), &pb.TailRequest{FromPosition: 1})
+	if err != nil {
+		t.Fatalf("tail 1 failed: %v", err)
+	}
+	first1, err := tailStream1.Recv()
+	if err != nil {
+		t.Fatalf("tail 1 first recv failed: %v", err)
+	}
+	if first1.ResumedFrom != 1 {
+		t.Errorf("expected ResumedFrom 1, got %d", first1.ResumedFrom)
+	}
+	if first1.Record.Position != 1 {
+		t.Errorf("expected position 1, got %d", first1.Record.Position)
+	}
+
+	// 2. Tail from position 4 (<= last_position + 1)
+	tailStream2, err := client.Tail(t.Context(), &pb.TailRequest{FromPosition: 4})
+	if err != nil {
+		t.Fatalf("tail 2 failed: %v", err)
+	}
+	first2, err := tailStream2.Recv()
+	if err != nil {
+		t.Fatalf("tail 2 first recv failed: %v", err)
+	}
+	if first2.ResumedFrom != 4 {
+		t.Errorf("expected ResumedFrom 4, got %d", first2.ResumedFrom)
+	}
+	if first2.Record.Position != 4 {
+		t.Errorf("expected position 4, got %d", first2.Record.Position)
+	}
+	second2, err := tailStream2.Recv()
+	if err != nil {
+		t.Fatalf("tail 2 second recv failed: %v", err)
+	}
+	if second2.ResumedFrom != 0 {
+		t.Errorf("expected ResumedFrom 0 on second message, got %d", second2.ResumedFrom)
+	}
+
+	// 3. Tail with provisional cursor from_position=20 (> manifest.last_position + 1 = 6)
+	// Should clamp to 6 and return resumed_from = 6
+	tailStream3, err := client.Tail(t.Context(), &pb.TailRequest{FromPosition: 20})
+	if err != nil {
+		t.Fatalf("tail 3 failed: %v", err)
+	}
+	first3, err := tailStream3.Recv()
+	if err != nil {
+		t.Fatalf("tail 3 first recv failed: %v", err)
+	}
+	if first3.ResumedFrom != 6 {
+		t.Errorf("expected ResumedFrom clamped to 6, got %d", first3.ResumedFrom)
+	}
+	if first3.Record.Position != 6 {
+		t.Errorf("expected position 6, got %d", first3.Record.Position)
+	}
+	_ = srv
 }
 
 func TestAppendGroupCommitAndFlush(t *testing.T) {
@@ -657,9 +676,9 @@ func TestRestartOnPersistentDataDir(t *testing.T) {
 		}
 	}
 
-	// Records 11..15 should have positions starting at srv2's position reservation (PositionFloorStep)
+	// Records 11..15 should have positions starting at manifest.last_position + 1 (11..15)
 	for i := 10; i < 15; i++ {
-		expectedPos := PositionFloorStep + uint64(i-10)
+		expectedPos := uint64(i + 1)
 		if receivedRecs[i].Position != expectedPos {
 			t.Errorf("expected position %d at index %d, got %d", expectedPos, i, receivedRecs[i].Position)
 		}

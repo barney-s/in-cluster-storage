@@ -610,6 +610,7 @@ func (x *LogRecord) GetCrc32C() uint32 {
 type TailResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Record        *LogRecord             `protobuf:"bytes,1,opt,name=record,proto3" json:"record,omitempty"`
+	ResumedFrom   uint64                 `protobuf:"varint,2,opt,name=resumed_from,json=resumedFrom,proto3" json:"resumed_from,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -651,6 +652,13 @@ func (x *TailResponse) GetRecord() *LogRecord {
 	return nil
 }
 
+func (x *TailResponse) GetResumedFrom() uint64 {
+	if x != nil {
+		return x.ResumedFrom
+	}
+	return 0
+}
+
 var File_proto_wal_proto protoreflect.FileDescriptor
 
 const file_proto_wal_proto_rawDesc = "" +
@@ -688,9 +696,10 @@ const file_proto_wal_proto_rawDesc = "" +
 	"\n" +
 	"stream_seq\x18\x03 \x01(\x04R\tstreamSeq\x12\x18\n" +
 	"\apayload\x18\x04 \x01(\fR\apayload\x12\x16\n" +
-	"\x06crc32c\x18\x05 \x01(\rR\x06crc32c\"?\n" +
+	"\x06crc32c\x18\x05 \x01(\rR\x06crc32c\"b\n" +
 	"\fTailResponse\x12/\n" +
-	"\x06record\x18\x01 \x01(\v2\x17.wal.v1alpha1.LogRecordR\x06record2\xd7\x01\n" +
+	"\x06record\x18\x01 \x01(\v2\x17.wal.v1alpha1.LogRecordR\x06record\x12!\n" +
+	"\fresumed_from\x18\x02 \x01(\x04R\vresumedFrom2\xd7\x01\n" +
 	"\tWalBuffer\x12G\n" +
 	"\x06Append\x12\x1b.wal.v1alpha1.AppendRequest\x1a\x1c.wal.v1alpha1.AppendResponse(\x010\x01\x12@\n" +
 	"\x05Flush\x12\x1a.wal.v1alpha1.FlushRequest\x1a\x1b.wal.v1alpha1.FlushResponse\x12?\n" +

@@ -90,11 +90,10 @@ type Server struct {
 	cfg     ServerConfig
 	backend blob.ObjectStorageBackend
 
-	mu            sync.RWMutex
-	lastPosition  uint64
-	positionFloor uint64
-	manifest      *Manifest
-	streams       map[string]*streamState // streamID string -> streamState
+	mu           sync.RWMutex
+	lastPosition uint64
+	manifest     *Manifest
+	streams      map[string]*streamState // streamID string -> streamState
 
 	localStore *wal.LogSegmentStore
 	tempDir    string
@@ -145,20 +144,9 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to load manifest: %w", err)
 	}
 
-	nextPosition := m.PositionFloor
-	if nextPosition == 0 {
-		m.PositionFloor = PositionFloorStep
-		nextPosition = 1
-	} else {
-		m.PositionFloor = nextPosition + PositionFloorStep
-	}
+	nextPosition := m.LastPosition + 1
 
-	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (position_floor=%d, segments=%d)", nextPosition, m.PositionFloor, len(m.Segments))
-
-	// Write updated manifest back immediately to reserve the position range
-	if err := SaveManifest(ctx, cfg.Backend, m); err != nil {
-		return nil, fmt.Errorf("failed to save initialized manifest: %w", err)
-	}
+	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (last_position=%d, segments=%d)", nextPosition, m.LastPosition, len(m.Segments))
 
 	// 2. Setup local segment store with a fixed prefix
 	dataDir := cfg.DataDir
@@ -181,17 +169,16 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:           cfg,
-		backend:       cfg.Backend,
-		lastPosition:  nextPosition - 1,
-		positionFloor: m.PositionFloor,
-		manifest:      m,
-		streams:       make(map[string]*streamState),
-		localStore:    localStore,
-		tempDir:       tempDir,
-		incomingChan:  make(chan incomingItem, 1024),
-		tailWaiters:   make(map[chan struct{}]struct{}),
-		stopChan:      make(chan struct{}),
+		cfg:          cfg,
+		backend:      cfg.Backend,
+		lastPosition: nextPosition - 1,
+		manifest:     m,
+		streams:      make(map[string]*streamState),
+		localStore:   localStore,
+		tempDir:      tempDir,
+		incomingChan: make(chan incomingItem, 1024),
+		tailWaiters:  make(map[chan struct{}]struct{}),
+		stopChan:     make(chan struct{}),
 	}
 	s.flushCond = sync.NewCond(&s.flushMu)
 
@@ -254,13 +241,6 @@ func (s *Server) LastPosition() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastPosition
-}
-
-// PositionFloor returns the reserved upper limit for position allocation.
-func (s *Server) PositionFloor() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.positionFloor
 }
 
 func (s *Server) getOrCreateStream(streamID uuid.UUID) *streamState {
@@ -528,20 +508,6 @@ func (s *Server) commitItems(items []incomingItem) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if position reservation exhausted
-	if s.lastPosition+uint64(len(items)) >= s.positionFloor {
-		klog.Errorf("Position allocation reached floor limit (%d >= %d), forcing flush", s.lastPosition, s.positionFloor)
-		for _, item := range items {
-			item.ackChan <- ackResult{err: errors.New("position allocation limit reached, please retry after flush")}
-		}
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_, _ = s.flushInternal(ctx)
-		}()
-		return
-	}
-
 	var recordsToStore []*wal.LogRecord
 
 	for _, item := range items {
@@ -744,12 +710,6 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 		s.manifest.LastPosition = lastPos
 	}
 
-	newFloor := s.positionFloor
-	if s.positionFloor-s.lastPosition <= FloorBumpThreshold {
-		newFloor = s.positionFloor + PositionFloorStep
-		s.manifest.PositionFloor = newFloor
-	}
-
 	var notifiedStreams []*streamState
 	for sid, maxSeq := range streamMaxSeq {
 		s.manifest.Streams[sid] = StreamState{S3AckedStreamSeq: maxSeq}
@@ -765,16 +725,8 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 
 	// 4. Save manifest to object storage
 	if err := SaveManifest(ctx, s.backend, s.manifest); err != nil {
-		// Revert manifest position floor on error so it stays consistent
-		s.manifest.PositionFloor = s.positionFloor
 		s.mu.Unlock()
 		return fmt.Errorf("failed to save manifest after flushing %s: %w", segPath, err)
-	}
-
-	// Make positionFloor visible in-memory ONLY after SaveManifest succeeds
-	if newFloor != s.positionFloor {
-		s.positionFloor = newFloor
-		klog.Infof("Durably bumped position floor to %d", s.positionFloor)
 	}
 	s.mu.Unlock()
 
@@ -793,6 +745,11 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 }
 
 // Tail streams merged records in position order from object storage, local disk, and live incoming commits.
+// Positions are strictly increasing within a witness incarnation; positions above the last flushed position
+// (manifest.last_position) are provisional and may be reassigned after a restart.
+// Tail clamps from_position to manifest.last_position + 1 when it exceeds that, returning the effective start
+// in resumed_from on the first response. Consumers must deduplicate on (stream_id, stream_seq) and must
+// tolerate re-delivery from the last flushed position after reconnecting.
 func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
 	ctx := stream.Context()
 	fromPos := req.FromPosition
@@ -800,7 +757,26 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 		fromPos = 1
 	}
 
+	s.mu.RLock()
+	lastFlushedPos := s.manifest.LastPosition
+	s.mu.RUnlock()
+
+	maxAllowedFromPos := lastFlushedPos + 1
+	if fromPos > maxAllowedFromPos {
+		fromPos = maxAllowedFromPos
+	}
+
 	currentPos := fromPos
+	firstSent := false
+
+	sendRecord := func(rec *wal.LogRecord) error {
+		resp := &pb.TailResponse{Record: rec.ToProto()}
+		if !firstSent {
+			resp.ResumedFrom = fromPos
+			firstSent = true
+		}
+		return stream.Send(resp)
+	}
 
 	waitChan := make(chan struct{}, 10)
 	s.tailMu.Lock()
@@ -840,7 +816,7 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 
 				for _, rec := range records {
 					if rec.Position >= currentPos {
-						if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+						if err := sendRecord(rec); err != nil {
 							return err
 						}
 						currentPos = rec.Position + 1
@@ -853,7 +829,7 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 		if currentPos <= serverLastPos {
 			err := s.localStore.ReadFrom(currentPos, func(rec *wal.LogRecord) error {
 				if rec.Position >= currentPos {
-					if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+					if err := sendRecord(rec); err != nil {
 						return err
 					}
 					currentPos = rec.Position + 1
