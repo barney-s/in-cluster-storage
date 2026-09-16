@@ -56,7 +56,7 @@ func TestWALE2E(t *testing.T) {
 	h.KindLoad("wal-buffer:e2e")
 	h.KindLoad("wal-client-test:e2e")
 
-	// Read and adapt manifest
+	// Read and adapt manifest to use hostPath for store directory to verify durability across pod restart
 	manifestPath := filepath.Join(experimentRoot, "k8s/wal.yaml")
 	b, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -65,6 +65,12 @@ func TestWALE2E(t *testing.T) {
 	manifest := string(b)
 	manifest = strings.ReplaceAll(manifest, "namespace: kube-objectfs-system", "namespace: default")
 	manifest = strings.ReplaceAll(manifest, "image: wal-buffer:latest", "image: wal-buffer:e2e\n          imagePullPolicy: Never")
+
+	// Replace store-dir emptyDir with a hostPath volume
+	manifest = strings.ReplaceAll(manifest, "- name: store-dir\n          emptyDir: {}", `- name: store-dir
+          hostPath:
+            path: /tmp/wal-store-e2e
+            type: DirectoryOrCreate`)
 
 	// Apply WAL buffer manifests
 	h.KubectlApplyContent("wal", manifest)
@@ -222,6 +228,289 @@ spec:
 
 	h.DeletePod("wal-tail", "default")
 	t.Logf("Successfully verified WAL E2E with buffer restart and replay!")
+}
+
+func TestWALMinIOE2E(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("Skipping WAL MinIO S3 E2E test; RUN_E2E not set")
+	}
+
+	h := NewHarness(t, "wal-s3-e2e")
+	h.Setup()
+
+	gitRoot := h.GetGitRoot()
+	experimentRoot := gitRoot
+
+	// Build images
+	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
+	h.DockerBuild("wal-client-test:e2e", filepath.Join(experimentRoot, "images/wal-client-test/Dockerfile"), experimentRoot)
+
+	// Load images into Kind
+	h.KindLoad("wal-buffer:e2e")
+	h.KindLoad("wal-client-test:e2e")
+
+	// 1. Deploy MinIO in Kind
+	minioYaml := `
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: default
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+      name: s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          args:
+            - "server"
+            - "/data"
+          env:
+            - name: MINIO_ROOT_USER
+              value: "minioadmin"
+            - name: MINIO_ROOT_PASSWORD
+              value: "minioadmin"
+          ports:
+            - containerPort: 9000
+              name: s3
+`
+	h.KubectlApplyContent("minio", minioYaml)
+	if err := h.WaitForDeployment("minio", "default", 2*time.Minute); err != nil {
+		t.Fatalf("MinIO deployment failed to start: %v", err)
+	}
+
+	// 2. Initialize MinIO bucket using mc job
+	mcJobYaml := `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-setup
+  namespace: default
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          command:
+            - "/bin/sh"
+            - "-c"
+            - "until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done; mc mb --ignore-existing local/wal-bucket"
+`
+	h.KubectlApplyContent("minio-setup", mcJobYaml)
+	if err := h.WaitForJobSuccess("minio-setup", "default", 2*time.Minute); err != nil {
+		t.Logf("MinIO logs:\n%s\n", h.GetPodLogs("app=minio", "default"))
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("MinIO bucket setup job failed: %v", err)
+	}
+
+	// 3. Deploy WAL Buffer configured with S3 backend pointing to MinIO
+	walBufferS3Yaml := `
+apiVersion: v1
+kind: Service
+metadata:
+  name: wal-buffer
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: wal-buffer
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: wal-buffer
+  namespace: default
+spec:
+  serviceName: wal-buffer
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wal-buffer
+  template:
+    metadata:
+      labels:
+        app: wal-buffer
+    spec:
+      containers:
+        - name: wal-buffer
+          image: wal-buffer:e2e
+          imagePullPolicy: Never
+          args:
+            - "--v=5"
+            - "--port=50051"
+            - "--data-dir=/data"
+            - "--backend=s3://wal-bucket/e2e?endpoint=http://minio:9000&region=us-east-1"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "minioadmin"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "minioadmin"
+            - name: AWS_REGION
+              value: "us-east-1"
+          ports:
+            - containerPort: 50051
+              name: grpc
+          volumeMounts:
+            - name: data-dir
+              mountPath: /data
+      volumes:
+        - name: data-dir
+          emptyDir: {}
+`
+	h.KubectlApplyContent("wal-s3", walBufferS3Yaml)
+	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+		t.Logf("Events:\n%s\n", h.GetEvents("default"))
+		t.Fatalf("WAL buffer S3 failed to start: %v", err)
+	}
+
+	// 4. Run Client 1 appending records
+	streamID1 := uuid.New().String()
+	clientPod1Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wal-client-s3-1
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: wal-client-test:e2e
+      imagePullPolicy: Never
+      args:
+        - "append"
+        - "--dir=/data/wal"
+        - "--stream-id=%s"
+        - "--target=wal-buffer:50051"
+        - "--count=10"
+        - "--wait-level=witness"
+        - "--hold-open=60s"
+      volumeMounts:
+        - name: wal-data
+          mountPath: /data/wal
+  volumes:
+    - name: wal-data
+      emptyDir: {}
+`, streamID1)
+
+	h.KubectlApplyContent("wal-client-s3-1", clientPod1Yaml)
+	time.Sleep(5 * time.Second)
+
+	// Step 5: Delete buffer pod to test restart with S3 backend
+	oldBufferUID := getPodUID("wal-buffer-0", "default")
+	t.Logf("Deleting WAL buffer pod (old UID=%s) with S3 backend", oldBufferUID)
+	h.DeletePod("wal-buffer-0", "default")
+
+	deadline := time.Now().Add(1 * time.Minute)
+	for time.Now().Before(deadline) {
+		currentUID := getPodUID("wal-buffer-0", "default")
+		if currentUID != "" && currentUID != oldBufferUID {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if err := h.WaitForStatefulSet("wal-buffer", "default", 2*time.Minute); err != nil {
+		t.Fatalf("Recreated WAL buffer failed to start: %v", err)
+	}
+
+	if err := waitForPodCompletion(h, "wal-client-s3-1", "default", 2*time.Minute); err != nil {
+		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
+		t.Fatalf("Client Pod 1 S3 failed: %v", err)
+	}
+	h.DeletePod("wal-client-s3-1", "default")
+
+	// Step 6: Run Client 2 appending 10 records with permanent ack
+	streamID2 := uuid.New().String()
+	clientPod2Yaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wal-client-s3-2
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: wal-client-test:e2e
+      imagePullPolicy: Never
+      args:
+        - "append"
+        - "--dir=/data/wal"
+        - "--stream-id=%s"
+        - "--target=wal-buffer:50051"
+        - "--count=10"
+        - "--wait-level=permanent"
+        - "--flush"
+      volumeMounts:
+        - name: wal-data
+          mountPath: /data/wal
+  volumes:
+    - name: wal-data
+      emptyDir: {}
+`, streamID2)
+
+	h.KubectlApplyContent("wal-client-s3-2", clientPod2Yaml)
+	if err := waitForPodCompletion(h, "wal-client-s3-2", "default", 2*time.Minute); err != nil {
+		t.Logf("Buffer Logs:\n%s\n", h.GetPodLogsByName("wal-buffer-0", "default"))
+		t.Fatalf("Client Pod 2 S3 failed: %v", err)
+	}
+	h.DeletePod("wal-client-s3-2", "default")
+
+	// Step 7: Verify all 20 records with Tail pod
+	tailPodYaml := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wal-tail-s3
+spec:
+  restartPolicy: Never
+  containers:
+    - name: tail
+      image: wal-client-test:e2e
+      imagePullPolicy: Never
+      args:
+        - "tail"
+        - "--target=wal-buffer:50051"
+        - "--from-pos=1"
+        - "--count=20"
+`
+	h.KubectlApplyContent("wal-tail-s3", tailPodYaml)
+	if err := waitForPodCompletion(h, "wal-tail-s3", "default", 2*time.Minute); err != nil {
+		t.Logf("Tail Pod Logs:\n%s\n", h.GetPodLogsByName("wal-tail-s3", "default"))
+		t.Fatalf("Tail verification pod S3 failed: %v", err)
+	}
+
+	tailLogs := h.GetPodLogsByName("wal-tail-s3", "default")
+	if !strings.Contains(tailLogs, "SUCCESS") {
+		t.Fatalf("Tail S3 did not succeed: %s", tailLogs)
+	}
+	h.DeletePod("wal-tail-s3", "default")
+	t.Logf("Successfully verified WAL E2E with S3/MinIO backend!")
 }
 
 func waitForPodCompletion(h *Harness, podName, namespace string, timeout time.Duration) error {

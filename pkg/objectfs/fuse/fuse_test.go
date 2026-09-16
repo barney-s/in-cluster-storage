@@ -68,7 +68,7 @@ func TestRawFileSystemOperations(t *testing.T) {
 
 	// 1. Getattr on root
 	var attrOut fuse.AttrOut
-	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{NodeId: fuse.FUSE_ROOT_ID}, &attrOut); status != fuse.OK {
+	if status := rawFS.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, &attrOut); status != fuse.OK {
 		t.Fatalf("Getattr on root failed: %v", status)
 	}
 	if attrOut.Attr.Mode&syscall.S_IFDIR == 0 {

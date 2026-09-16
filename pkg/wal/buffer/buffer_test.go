@@ -29,15 +29,15 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func startTestServer(t *testing.T, backend blob.ObjectStorageBackend, dataDir string) (*Server, string, func()) {
+func startTestServer(t *testing.T, backend objectstore.Backend, dataDir string) (*Server, string, func()) {
 	ctx := t.Context()
 	srv, err := NewServer(ctx, ServerConfig{
 		Backend:       backend,
@@ -71,7 +71,7 @@ func startTestServer(t *testing.T, backend blob.ObjectStorageBackend, dataDir st
 }
 
 func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
 
@@ -118,7 +118,7 @@ func TestServerStartupReadOnlyUntilFlush(t *testing.T) {
 }
 
 func TestTailClampingAndResumedFrom(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
 
@@ -214,7 +214,7 @@ func TestTailClampingAndResumedFrom(t *testing.T) {
 }
 
 func TestAppendGroupCommitAndFlush(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
 
@@ -301,7 +301,7 @@ func TestAppendGroupCommitAndFlush(t *testing.T) {
 }
 
 func TestTailFlushedAndUnflushedMidStreamFlush(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	dataDir := t.TempDir()
 	srv, addr, cleanup := startTestServer(t, backend, dataDir)
 	defer cleanup()
@@ -431,7 +431,7 @@ func TestTailFlushedAndUnflushedMidStreamFlush(t *testing.T) {
 }
 
 func TestTailMemoryBounded(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	dataDir := t.TempDir()
 
 	ctx := t.Context()
@@ -496,7 +496,7 @@ func TestTailMemoryBounded(t *testing.T) {
 }
 
 func TestRetentionPreservesUnflushedFiles(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	dataDir := t.TempDir()
 
 	ctx := t.Context()
@@ -575,7 +575,7 @@ func TestRetentionPreservesUnflushedFiles(t *testing.T) {
 }
 
 func TestRestartOnPersistentDataDir(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	dataDir := t.TempDir()
 
 	ctx := t.Context()
@@ -711,11 +711,11 @@ func recvAppendResponseWithTimeout(t *testing.T, stream pb.WalBuffer_AppendClien
 }
 
 func TestFlushIsolationAcrossServers(t *testing.T) {
-	backendA := controller.NewMemoryBackend()
+	backendA := inmemorystorage.New()
 	srvA, addrA, cleanupA := startTestServer(t, backendA, t.TempDir())
 	defer cleanupA()
 
-	backendB := controller.NewMemoryBackend()
+	backendB := inmemorystorage.New()
 	srvB, addrB, cleanupB := startTestServer(t, backendB, t.TempDir())
 	defer cleanupB()
 
@@ -829,7 +829,7 @@ func TestFlushIsolationAcrossServers(t *testing.T) {
 }
 
 func TestFlushIsolationAcrossStreams(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
 	defer cleanup()
 

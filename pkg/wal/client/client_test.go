@@ -26,7 +26,8 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/inmemorystorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -53,7 +54,7 @@ func (h *testServerHandle) StopWithoutClose() {
 	_ = h.listener.Close()
 }
 
-func startBufferServer(t *testing.T, backend *controller.MemoryBackend, dataDir string) *testServerHandle {
+func startBufferServer(t *testing.T, backend objectstore.Backend, dataDir string) *testServerHandle {
 	ctx := t.Context()
 	srv, err := buffer.NewServer(ctx, buffer.ServerConfig{
 		Backend:       backend,
@@ -87,7 +88,7 @@ func startBufferServer(t *testing.T, backend *controller.MemoryBackend, dataDir 
 
 // 1. Append, witness ack, then permanent ack after Flush; local file deleted only after permanent ack.
 func TestAppendWitnessAndPermanentAck(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	defer handle.StopGraceful()
 
@@ -148,7 +149,7 @@ func TestAppendWitnessAndPermanentAck(t *testing.T) {
 // Client reconnects, replays un-permanently-acked records, restarted buffer assigns positions starting at last_position + 1,
 // all witness-acked records reappear via Tail, and a Tail resumed from a provisional cursor is clamped and reports resumed_from.
 func TestBufferServiceRestartWithoutClose(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle1 := startBufferServer(t, backend, t.TempDir())
 
 	clientDir := t.TempDir()
@@ -277,7 +278,7 @@ func TestBufferServiceRestartWithoutClose(t *testing.T) {
 // 3. A consumer tails through a crash, keeps a (stream_id -> max stream_seq) map,
 // reconnects with its old cursor, and ends up with exactly one copy of every record.
 func TestConsumerTailThroughCrashWithDedup(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle1 := startBufferServer(t, backend, t.TempDir())
 
 	clientDir := t.TempDir()
@@ -420,7 +421,7 @@ func TestConsumerTailThroughCrashWithDedup(t *testing.T) {
 
 // 4. Client restarted mid-stream: retained records replayed, duplicates dropped, no gaps in stream_seq.
 func TestClientRestartMidStream(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	defer handle.StopGraceful()
 
@@ -471,7 +472,7 @@ func TestClientRestartMidStream(t *testing.T) {
 
 // 4. Two clients interleaved: Tail order is strictly monotonic in position.
 func TestTwoClientsInterleaved(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	defer handle.StopGraceful()
 
@@ -548,7 +549,7 @@ func TestTwoClientsInterleaved(t *testing.T) {
 
 // 5. Service unreachable: Append keeps succeeding until the retained cap, then blocks; unblocks after reconnect.
 func TestServiceUnreachableBackpressure(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	handle.StopGraceful() // Terminate service immediately so service is unreachable
 
@@ -607,7 +608,7 @@ func TestInvalidWaitLevel(t *testing.T) {
 
 // 7. Wait(Permanent, requestFlush=true) waits for witness first so Flush flushes the newly appended records.
 func TestWaitPermanentFlushesAfterWitness(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir()) // 10s flush interval
 	defer handle.StopGraceful()
 
@@ -643,7 +644,7 @@ func TestWaitPermanentFlushesAfterWitness(t *testing.T) {
 
 // 8. Stream.Flush() waits for witness first before issuing Flush RPC.
 func TestFlushFlushesAfterWitness(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir()) // 10s flush interval
 	defer handle.StopGraceful()
 
@@ -679,11 +680,11 @@ func TestFlushFlushesAfterWitness(t *testing.T) {
 
 // 9. Two servers in one process: a flush on server A must not produce an ack on server B's stream.
 func TestTwoServersFlushIsolation(t *testing.T) {
-	backendA := controller.NewMemoryBackend()
+	backendA := inmemorystorage.New()
 	handleA := startBufferServer(t, backendA, t.TempDir())
 	defer handleA.StopGraceful()
 
-	backendB := controller.NewMemoryBackend()
+	backendB := inmemorystorage.New()
 	handleB := startBufferServer(t, backendB, t.TempDir())
 	defer handleB.StopGraceful()
 
@@ -739,7 +740,7 @@ func TestTwoServersFlushIsolation(t *testing.T) {
 
 // 10. Two streams on one server: a flush containing records from only one advances only that stream's permanent watermark.
 func TestTwoStreamsOneServerFlushIsolation(t *testing.T) {
-	backend := controller.NewMemoryBackend()
+	backend := inmemorystorage.New()
 	handle := startBufferServer(t, backend, t.TempDir())
 	defer handle.StopGraceful()
 

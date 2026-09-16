@@ -29,6 +29,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/objectfs/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
 )
@@ -36,6 +37,7 @@ import (
 var (
 	port          = flag.Int("port", 50051, "The server port")
 	csiEndpoint   = flag.String("csi-endpoint", "", "CSI endpoint (e.g. unix:///csi/csi.sock)")
+	backendFlag   = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
 	flushInterval = flag.Duration("flush-interval", 1*time.Hour, "Periodic flush interval to backend object storage")
 )
 
@@ -60,13 +62,18 @@ func main() {
 		klog.Fatalf("failed to listen: %v", err)
 	}
 
+	ctx := context.Background()
+	backend, err := objectstore.Open(ctx, *backendFlag)
+	if err != nil {
+		klog.Fatalf("failed to initialize backend %q: %v", *backendFlag, err)
+	}
+
 	grpcServer := grpc.NewServer()
-	backend := controller.NewMemoryBackend()
 	server := controller.NewServer(backend)
 	csiController := controller.NewCSIController(server)
 
 	if *flushInterval > 0 {
-		server.StartPeriodicFlush(context.Background(), *flushInterval)
+		server.StartPeriodicFlush(ctx, *flushInterval)
 		defer server.StopPeriodicFlush()
 	}
 
