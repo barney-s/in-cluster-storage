@@ -171,3 +171,174 @@ func TestTornTrailingRecordDropAndRecoverFile(t *testing.T) {
 		t.Errorf("expected .recover backup file to be created upon truncation")
 	}
 }
+
+func TestLogSegmentStoreReadFrom(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Small maxSegmentSize so files rotate frequently (~100 bytes each)
+	store, err := NewLogSegmentStore(tmpDir, "log", 120)
+	if err != nil {
+		t.Fatalf("failed to create log segment store: %v", err)
+	}
+	defer store.Close()
+
+	streamID := uuid.New()
+	var records []*LogRecord
+	for i := uint64(1); i <= 10; i++ {
+		rec := &LogRecord{
+			Position:  i,
+			StreamID:  streamID,
+			StreamSeq: i,
+			Payload:   []byte("payload-data"),
+		}
+		records = append(records, rec)
+	}
+
+	if err := store.AppendBatch(records); err != nil {
+		t.Fatalf("failed to append batch: %v", err)
+	}
+
+	// 1. Read from position 1 (all records)
+	var readFrom1 []uint64
+	err = store.ReadFrom(1, func(r *LogRecord) error {
+		readFrom1 = append(readFrom1, r.Position)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadFrom(1) failed: %v", err)
+	}
+	if len(readFrom1) != 10 {
+		t.Fatalf("expected 10 records, got %d: %v", len(readFrom1), readFrom1)
+	}
+	for i, pos := range readFrom1 {
+		if pos != uint64(i+1) {
+			t.Errorf("expected position %d at index %d, got %d", i+1, i, pos)
+		}
+	}
+
+	// 2. Read from position 5 (records 5..10)
+	var readFrom5 []uint64
+	err = store.ReadFrom(5, func(r *LogRecord) error {
+		readFrom5 = append(readFrom5, r.Position)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadFrom(5) failed: %v", err)
+	}
+	if len(readFrom5) != 6 {
+		t.Fatalf("expected 6 records, got %d: %v", len(readFrom5), readFrom5)
+	}
+	for i, pos := range readFrom5 {
+		if pos != uint64(i+5) {
+			t.Errorf("expected position %d at index %d, got %d", i+5, i, pos)
+		}
+	}
+
+	// 3. Read from position 10
+	var readFrom10 []uint64
+	err = store.ReadFrom(10, func(r *LogRecord) error {
+		readFrom10 = append(readFrom10, r.Position)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadFrom(10) failed: %v", err)
+	}
+	if len(readFrom10) != 1 || readFrom10[0] != 10 {
+		t.Fatalf("expected [10], got %v", readFrom10)
+	}
+
+	// 4. Read from beyond last position
+	var readFrom11 []uint64
+	err = store.ReadFrom(11, func(r *LogRecord) error {
+		readFrom11 = append(readFrom11, r.Position)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadFrom(11) failed: %v", err)
+	}
+	if len(readFrom11) != 0 {
+		t.Fatalf("expected 0 records, got %v", readFrom11)
+	}
+
+	// 5. Test tolerant trailing partial record
+	store.mu.RLock()
+	activePath := store.activeMeta.Path
+	store.mu.RUnlock()
+
+	f, err := os.OpenFile(activePath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("failed to open active file: %v", err)
+	}
+	// Append incomplete record bytes
+	_, _ = f.Write([]byte("WALL\x00\x00\x00\x00\x00\x00\x00\x0b"))
+	_ = f.Close()
+
+	var readAfterPartial []uint64
+	err = store.ReadFrom(1, func(r *LogRecord) error {
+		readAfterPartial = append(readAfterPartial, r.Position)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected ReadFrom to tolerate trailing partial record, got error: %v", err)
+	}
+	if len(readAfterPartial) != 10 {
+		t.Fatalf("expected 10 records after partial trailing write, got %d", len(readAfterPartial))
+	}
+}
+
+func TestLogSegmentStoreDeleteSegmentsThrough(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewLogSegmentStore(tmpDir, "log", 100)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	streamID := uuid.New()
+	for i := uint64(1); i <= 8; i++ {
+		rec := &LogRecord{
+			Position:  i,
+			StreamID:  streamID,
+			StreamSeq: i,
+			Payload:   []byte("test-payload-123"),
+		}
+		if err := store.AppendBatch([]*LogRecord{rec}); err != nil {
+			t.Fatalf("append batch %d failed: %v", i, err)
+		}
+	}
+
+	store.mu.RLock()
+	initialSegCount := len(store.segments)
+	store.mu.RUnlock()
+
+	if initialSegCount < 3 {
+		t.Fatalf("expected multiple segments rotated, got %d", initialSegCount)
+	}
+
+	// 1. Delete flushed through position 2 with maxRetainedBytes = 0
+	if err := store.DeleteSegmentsThrough(2, 0); err != nil {
+		t.Fatalf("DeleteSegmentsThrough failed: %v", err)
+	}
+
+	store.mu.RLock()
+	for _, seg := range store.segments {
+		if seg.LastSeq <= 2 && seg != store.activeMeta {
+			t.Errorf("expected segment with LastSeq <= 2 to be deleted, but still present: %+v", seg)
+		}
+	}
+	store.mu.RUnlock()
+
+	// 2. Try to delete through position 100 with maxRetainedBytes = 0.
+	// Active segment must NEVER be deleted even though position 100 > all records.
+	if err := store.DeleteSegmentsThrough(100, 0); err != nil {
+		t.Fatalf("DeleteSegmentsThrough failed: %v", err)
+	}
+
+	store.mu.RLock()
+	if len(store.segments) == 0 {
+		t.Fatalf("expected active segment to be retained, got 0 segments")
+	}
+	if store.activeMeta == nil {
+		t.Fatalf("expected activeMeta not nil")
+	}
+	store.mu.RUnlock()
+}
