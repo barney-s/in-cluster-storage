@@ -1,0 +1,87 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package wal.v1alpha1;
+
+option go_package = "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1;v1alpha1";
+
+service WalBuffer {
+  // One bidi stream per client stream. First message must be Hello.
+  rpc Append(stream AppendRequest) returns (stream AppendResponse);
+  // Force a flush to permanent object storage now. Returns once the manifest is written.
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  // Read merged records in position order. Position is unique and strictly increasing for the life of the log.
+  // Note: a record may appear under two positions if the witness restarted between witness ack and permanent ack;
+  // consumers must deduplicate on (stream_id, stream_seq).
+  rpc Tail(TailRequest) returns (stream TailResponse);
+}
+
+message AppendRequest {
+  oneof msg {
+    Hello hello = 1;
+    AppendRecord record = 2;
+  }
+}
+
+message Hello {
+  bytes stream_id = 1;
+}
+
+message AppendResponse {
+  oneof msg {
+    HelloAck hello_ack = 1;
+    Ack ack = 2;
+  }
+}
+
+message HelloAck {
+  uint64 witness_acked_stream_seq = 1;  // what the service has on local disk
+  uint64 s3_acked_stream_seq = 2;       // what the manifest says (permanent storage)
+}
+
+message AppendRecord {
+  uint64 stream_seq = 1;
+  bytes payload = 2;
+  uint32 crc32c = 3;
+}
+
+message Ack {
+  uint64 witness_acked_stream_seq = 1;  // cumulative
+  uint64 s3_acked_stream_seq = 2;       // cumulative
+}
+
+message FlushRequest {
+}
+
+message FlushResponse {
+  uint64 last_position = 1;
+}
+
+message TailRequest {
+  uint64 from_position = 1;
+}
+
+message LogRecord {
+  uint64 position = 1;
+  bytes stream_id = 2;
+  uint64 stream_seq = 3;
+  bytes payload = 4;
+  uint32 crc32c = 5;
+}
+
+message TailResponse {
+  LogRecord record = 1;
+}
