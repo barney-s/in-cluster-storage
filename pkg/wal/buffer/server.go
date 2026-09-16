@@ -96,7 +96,6 @@ type Server struct {
 
 	// Tail broadcasting
 	tailMu      sync.RWMutex
-	tailHistory []*wal.LogRecord // committed in-memory cache for recent tailing
 	tailWaiters map[chan struct{}]struct{}
 
 	flushMu    sync.Mutex
@@ -150,7 +149,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to save initialized manifest: %w", err)
 	}
 
-	// 2. Setup local segment store
+	// 2. Setup local segment store with a fixed prefix
 	dataDir := cfg.DataDir
 	var tempDir string
 	if dataDir == "" {
@@ -162,7 +161,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		tempDir = td
 	}
 
-	localStore, recoveredRecords, err := wal.NewLogSegmentStore(dataDir, fmt.Sprintf("pos-%012d", nextPosition), cfg.FlushBytes)
+	localStore, err := wal.NewLogSegmentStore(dataDir, "log", cfg.FlushBytes)
 	if err != nil {
 		if tempDir != "" {
 			_ = os.RemoveAll(tempDir)
@@ -171,18 +170,17 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:              cfg,
-		backend:          cfg.Backend,
-		lastPosition:     nextPosition - 1,
-		positionFloor:    m.PositionFloor,
-		manifest:         m,
-		streams:          make(map[string]*streamState),
-		localStore:       localStore,
-		tempDir:          tempDir,
-		incomingChan:     make(chan incomingItem, 1024),
-		tailWaiters:      make(map[chan struct{}]struct{}),
-		stopChan:         make(chan struct{}),
-		unflushedRecords: recoveredRecords,
+		cfg:           cfg,
+		backend:       cfg.Backend,
+		lastPosition:  nextPosition - 1,
+		positionFloor: m.PositionFloor,
+		manifest:      m,
+		streams:       make(map[string]*streamState),
+		localStore:    localStore,
+		tempDir:       tempDir,
+		incomingChan:  make(chan incomingItem, 1024),
+		tailWaiters:   make(map[chan struct{}]struct{}),
+		stopChan:      make(chan struct{}),
 	}
 	s.flushCond = sync.NewCond(&s.flushMu)
 
@@ -192,28 +190,6 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 			witnessSeq: st.S3AckedStreamSeq,
 			s3Seq:      st.S3AckedStreamSeq,
 		}
-	}
-
-	// Update witness watermarks and tail history from recovered records
-	for _, rec := range recoveredRecords {
-		s.unflushedBytes += int64(wal.LogHeaderSize + len(rec.Payload))
-		if rec.Position > s.lastPosition {
-			s.lastPosition = rec.Position
-		}
-		sid := rec.StreamID.String()
-		st, exists := s.streams[sid]
-		if !exists {
-			st = &streamState{
-				witnessSeq: rec.StreamSeq,
-				s3Seq:      0,
-			}
-			s.streams[sid] = st
-		} else {
-			if rec.StreamSeq > st.witnessSeq {
-				st.witnessSeq = rec.StreamSeq
-			}
-		}
-		s.tailHistory = append(s.tailHistory, rec)
 	}
 
 	// Start background group commit worker
@@ -557,7 +533,7 @@ func (s *Server) commitItems(items []incomingItem) {
 		return
 	}
 
-	// 2. Add to unflushed queue and tail cache
+	// 2. Add to unflushed queue and notify tail waiters
 	s.unflushedMu.Lock()
 	for _, rec := range recordsToStore {
 		s.unflushedRecords = append(s.unflushedRecords, rec)
@@ -567,7 +543,6 @@ func (s *Server) commitItems(items []incomingItem) {
 	s.unflushedMu.Unlock()
 
 	s.tailMu.Lock()
-	s.tailHistory = append(s.tailHistory, recordsToStore...)
 	for waiter := range s.tailWaiters {
 		select {
 		case waiter <- struct{}{}:
@@ -763,8 +738,8 @@ func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
 	}
 	s.mu.Unlock()
 
-	// 5. Clean up local segment files
-	if err := s.localStore.DeleteSegmentsBeforeBytes(s.cfg.TailCacheBytes); err != nil {
+	// 5. Clean up local segment files that have been flushed to permanent storage
+	if err := s.localStore.DeleteSegmentsThrough(s.manifest.LastPosition, s.cfg.TailCacheBytes); err != nil {
 		klog.Warningf("Error cleaning local segment files: %v", err)
 	}
 
@@ -808,7 +783,7 @@ func (s *Server) broadcastS3Ack() {
 	}
 }
 
-// Tail streams merged records in position order.
+// Tail streams merged records in position order from object storage, local disk, and live incoming commits.
 func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
 	ctx := stream.Context()
 	fromPos := req.FromPosition
@@ -818,38 +793,6 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 
 	currentPos := fromPos
 
-	// 1. Check permanent storage segments if needed
-	s.mu.RLock()
-	segments := make([]string, len(s.manifest.Segments))
-	copy(segments, s.manifest.Segments)
-	s.mu.RUnlock()
-
-	for _, segPath := range segments {
-		_, segLast, err := wal.ParseSegmentPath(segPath)
-		if err != nil {
-			continue
-		}
-		if segLast < currentPos {
-			continue
-		}
-
-		records, err := ReadSegmentFromBackend(ctx, s.backend, segPath)
-		if err != nil {
-			klog.Warningf("Tail failed to read segment %s: %v", segPath, err)
-			continue
-		}
-
-		for _, rec := range records {
-			if rec.Position >= currentPos {
-				if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
-					return err
-				}
-				currentPos = rec.Position + 1
-			}
-		}
-	}
-
-	// 2. Stream from memory tail cache and live incoming records
 	waitChan := make(chan struct{}, 10)
 	s.tailMu.Lock()
 	s.tailWaiters[waitChan] = struct{}{}
@@ -861,24 +804,75 @@ func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error
 	}()
 
 	for {
-		s.tailMu.RLock()
-		records := make([]*wal.LogRecord, 0, len(s.tailHistory))
-		for _, r := range s.tailHistory {
-			if r.Position >= currentPos {
-				records = append(records, r)
-			}
-		}
-		s.tailMu.RUnlock()
+		// 1. Snapshot manifest and lastPosition under s.mu.RLock
+		s.mu.RLock()
+		manifestLastPos := s.manifest.LastPosition
+		segments := make([]string, len(s.manifest.Segments))
+		copy(segments, s.manifest.Segments)
+		serverLastPos := s.lastPosition
+		s.mu.RUnlock()
 
-		for _, rec := range records {
-			if rec.Position >= currentPos {
-				if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
-					return err
+		// 2. Read flushed segments from object storage if currentPos <= manifestLastPos
+		if currentPos <= manifestLastPos {
+			for _, segPath := range segments {
+				_, segLast, err := wal.ParseSegmentPath(segPath)
+				if err != nil {
+					continue
 				}
-				currentPos = rec.Position + 1
+				if segLast < currentPos {
+					continue
+				}
+
+				records, err := ReadSegmentFromBackend(ctx, s.backend, segPath)
+				if err != nil {
+					klog.Warningf("Tail failed to read segment %s: %v", segPath, err)
+					return fmt.Errorf("failed to read flushed segment %s: %w", segPath, err)
+				}
+
+				for _, rec := range records {
+					if rec.Position >= currentPos {
+						if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+							return err
+						}
+						currentPos = rec.Position + 1
+					}
+				}
 			}
 		}
 
+		// 3. Read committed unflushed records from local LogSegmentStore
+		if currentPos <= serverLastPos {
+			err := s.localStore.ReadFrom(currentPos, func(rec *wal.LogRecord) error {
+				if rec.Position >= currentPos {
+					if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+						return err
+					}
+					currentPos = rec.Position + 1
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		// 4. Re-snapshot to check if a flush moved records from local disk to object storage
+		s.mu.RLock()
+		latestManifestLastPos := s.manifest.LastPosition
+		latestServerLastPos := s.lastPosition
+		s.mu.RUnlock()
+
+		if currentPos <= latestManifestLastPos {
+			// Manifest advanced past currentPos; continue from object storage without blocking
+			continue
+		}
+
+		if currentPos <= latestServerLastPos {
+			// New records committed locally; continue from local store without blocking
+			continue
+		}
+
+		// 5. Block on new commits, cancellation, or shutdown
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

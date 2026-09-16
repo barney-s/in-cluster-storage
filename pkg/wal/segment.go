@@ -332,8 +332,9 @@ type LogSegmentStore struct {
 	segments   []*SegmentMeta
 }
 
-// NewLogSegmentStore initializes or reopens a log segment store.
-func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*LogSegmentStore, []*LogRecord, error) {
+// NewLogSegmentStore initializes a log segment store with a fixed prefix.
+// Any segment files from previous incarnations in dir are cleaned up on startup.
+func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*LogSegmentStore, error) {
 	if maxSegmentSize <= 0 {
 		maxSegmentSize = DefaultMaxSegmentSize
 	}
@@ -341,21 +342,19 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*L
 		filePrefix = "log"
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
+		return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
 	}
 
-	var walFiles []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), filePrefix+"-") && strings.HasSuffix(entry.Name(), ".wal") {
-			walFiles = append(walFiles, filepath.Join(dir, entry.Name()))
+		if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".wal") || strings.Contains(entry.Name(), ".wal.")) {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
 		}
 	}
-	sort.Strings(walFiles)
 
 	store := &LogSegmentStore{
 		dir:            dir,
@@ -363,21 +362,7 @@ func NewLogSegmentStore(dir string, filePrefix string, maxSegmentSize int64) (*L
 		filePrefix:     filePrefix,
 	}
 
-	var allRecords []*LogRecord
-	for _, file := range walFiles {
-		records, meta, err := ScanLogSegmentFile(file)
-		if err != nil {
-			return nil, nil, err
-		}
-		if meta.RecordCount > 0 {
-			store.segments = append(store.segments, meta)
-			allRecords = append(allRecords, records...)
-		} else {
-			_ = os.Remove(file)
-		}
-	}
-
-	return store, allRecords, nil
+	return store, nil
 }
 
 func (s *LogSegmentStore) segmentFilename(firstPos uint64) string {
@@ -450,8 +435,65 @@ func (s *LogSegmentStore) rotateLocked(firstPos uint64) error {
 	return nil
 }
 
-// DeleteSegmentsBeforeBytes cleans up older segment files to stay within maxRetainedBytes.
-func (s *LogSegmentStore) DeleteSegmentsBeforeBytes(maxRetainedBytes int64) error {
+// ReadFrom scans log segment files starting from the segment containing or preceding position,
+// decodes LogRecords, and invokes fn for every record where Position >= position.
+// It tolerates the active file growing while being read by stopping at the last fully-written record.
+func (s *LogSegmentStore) ReadFrom(position uint64, fn func(*LogRecord) error) error {
+	s.mu.RLock()
+	if len(s.segments) == 0 {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	segs := make([]*SegmentMeta, len(s.segments))
+	copy(segs, s.segments)
+	s.mu.RUnlock()
+
+	// Binary search for the first segment that could contain position
+	idx := sort.Search(len(segs), func(i int) bool {
+		return segs[i].FirstSeq > position
+	})
+	startIdx := 0
+	if idx > 0 {
+		startIdx = idx - 1
+	}
+
+	for _, seg := range segs[startIdx:] {
+		f, err := os.Open(seg.Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("failed to open segment %s: %w", seg.Path, err)
+		}
+
+		for {
+			rec, err := DecodeLogRecord(f)
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, ErrTruncatedRecord) || errors.Is(err, io.ErrUnexpectedEOF) {
+					break
+				}
+				_ = f.Close()
+				return fmt.Errorf("failed decoding log record in %s: %w", seg.Path, err)
+			}
+			if rec.Position >= position {
+				if err := fn(rec); err != nil {
+					_ = f.Close()
+					return err
+				}
+			}
+		}
+		_ = f.Close()
+	}
+
+	return nil
+}
+
+// DeleteSegmentsThrough removes flushed segment files to stay within maxRetainedBytes.
+// A segment file is eligible for deletion only if it is not the active segment and all its records
+// are <= flushedPosition (i.e. LastSeq <= flushedPosition).
+// A segment containing any unflushed record is never deleted.
+func (s *LogSegmentStore) DeleteSegmentsThrough(flushedPosition uint64, maxRetainedBytes int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -466,11 +508,14 @@ func (s *LogSegmentStore) DeleteSegmentsBeforeBytes(maxRetainedBytes int64) erro
 
 	var remaining []*SegmentMeta
 	for _, seg := range s.segments {
-		if seg == s.activeMeta || totalBytes <= maxRetainedBytes {
+		// Never delete active file or segments containing unflushed records
+		if seg == s.activeMeta || seg.LastSeq > flushedPosition || totalBytes <= maxRetainedBytes {
 			remaining = append(remaining, seg)
 			continue
 		}
+
 		if err := os.Remove(seg.Path); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove flushed segment file %s: %v", seg.Path, err)
 			remaining = append(remaining, seg)
 			continue
 		}
