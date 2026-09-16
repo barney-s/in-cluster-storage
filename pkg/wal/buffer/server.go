@@ -1,0 +1,890 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package buffer
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"time"
+
+	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/wal"
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
+)
+
+const (
+	DefaultFlushInterval = 60 * time.Second
+	DefaultFlushBytes    = 64 * 1024 * 1024
+	DefaultTailCache     = 64 * 1024 * 1024
+	DefaultBatchDelay    = 5 * time.Millisecond
+	DefaultBatchSize     = 1024 * 1024
+)
+
+// ServerConfig configures the WAL Buffer service.
+type ServerConfig struct {
+	Backend        blob.ObjectStorageBackend
+	DataDir        string
+	FlushInterval  time.Duration
+	FlushBytes     int64
+	TailCacheBytes int64
+	BatchMaxDelay  time.Duration
+	BatchMaxSize   int64
+}
+
+type incomingItem struct {
+	streamID  uuid.UUID
+	streamSeq uint64
+	payload   []byte
+	ackChan   chan ackResult
+}
+
+type ackResult struct {
+	witnessSeq uint64
+	s3Seq      uint64
+	err        error
+}
+
+type streamState struct {
+	witnessSeq uint64
+	s3Seq      uint64
+}
+
+// Server implements the WalBuffer gRPC service.
+type Server struct {
+	pb.UnimplementedWalBufferServer
+
+	cfg     ServerConfig
+	backend blob.ObjectStorageBackend
+
+	mu            sync.RWMutex
+	lastPosition  uint64
+	positionFloor uint64
+	manifest      *Manifest
+	streams       map[string]*streamState // streamID string -> streamState
+
+	localStore *wal.LogSegmentStore
+	tempDir    string
+
+	incomingChan chan incomingItem
+
+	unflushedMu      sync.Mutex
+	unflushedRecords []*wal.LogRecord
+	unflushedBytes   int64
+
+	// Tail broadcasting
+	tailMu      sync.RWMutex
+	tailHistory []*wal.LogRecord // committed in-memory cache for recent tailing
+	tailWaiters map[chan struct{}]struct{}
+
+	flushMu    sync.Mutex
+	flushCond  *sync.Cond
+	isFlushing bool
+	flushSeq   uint64 // incremented on each successful flush
+
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+}
+
+// NewServer creates and initializes a new WAL buffer Server.
+func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
+	if cfg.Backend == nil {
+		return nil, errors.New("backend cannot be nil")
+	}
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = DefaultFlushInterval
+	}
+	if cfg.FlushBytes <= 0 {
+		cfg.FlushBytes = DefaultFlushBytes
+	}
+	if cfg.TailCacheBytes <= 0 {
+		cfg.TailCacheBytes = DefaultTailCache
+	}
+	if cfg.BatchMaxDelay <= 0 {
+		cfg.BatchMaxDelay = DefaultBatchDelay
+	}
+	if cfg.BatchMaxSize <= 0 {
+		cfg.BatchMaxSize = DefaultBatchSize
+	}
+
+	// 1. Read manifest from backend
+	m, err := LoadManifest(ctx, cfg.Backend)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load manifest: %w", err)
+	}
+
+	nextPosition := m.PositionFloor
+	if nextPosition == 0 {
+		m.PositionFloor = PositionFloorStep
+		nextPosition = 1
+	} else {
+		m.PositionFloor = nextPosition + PositionFloorStep
+	}
+
+	klog.Infof("WAL Buffer initializing: assigning positions starting at %d (position_floor=%d, segments=%d)", nextPosition, m.PositionFloor, len(m.Segments))
+
+	// Write updated manifest back immediately to reserve the position range
+	if err := SaveManifest(ctx, cfg.Backend, m); err != nil {
+		return nil, fmt.Errorf("failed to save initialized manifest: %w", err)
+	}
+
+	// 2. Setup local segment store
+	dataDir := cfg.DataDir
+	var tempDir string
+	if dataDir == "" {
+		td, err := os.MkdirTemp("", "wal-buffer-data-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp data dir: %w", err)
+		}
+		dataDir = td
+		tempDir = td
+	}
+
+	localStore, recoveredRecords, err := wal.NewLogSegmentStore(dataDir, fmt.Sprintf("pos-%012d", nextPosition), cfg.FlushBytes)
+	if err != nil {
+		if tempDir != "" {
+			_ = os.RemoveAll(tempDir)
+		}
+		return nil, fmt.Errorf("failed to initialize local segment store: %w", err)
+	}
+
+	s := &Server{
+		cfg:              cfg,
+		backend:          cfg.Backend,
+		lastPosition:     nextPosition - 1,
+		positionFloor:    m.PositionFloor,
+		manifest:         m,
+		streams:          make(map[string]*streamState),
+		localStore:       localStore,
+		tempDir:          tempDir,
+		incomingChan:     make(chan incomingItem, 1024),
+		tailWaiters:      make(map[chan struct{}]struct{}),
+		stopChan:         make(chan struct{}),
+		unflushedRecords: recoveredRecords,
+	}
+	s.flushCond = sync.NewCond(&s.flushMu)
+
+	// Populate initial streams state from manifest
+	for sid, st := range m.Streams {
+		s.streams[sid] = &streamState{
+			witnessSeq: st.S3AckedStreamSeq,
+			s3Seq:      st.S3AckedStreamSeq,
+		}
+	}
+
+	// Update witness watermarks and tail history from recovered records
+	for _, rec := range recoveredRecords {
+		s.unflushedBytes += int64(wal.LogHeaderSize + len(rec.Payload))
+		if rec.Position > s.lastPosition {
+			s.lastPosition = rec.Position
+		}
+		sid := rec.StreamID.String()
+		st, exists := s.streams[sid]
+		if !exists {
+			st = &streamState{
+				witnessSeq: rec.StreamSeq,
+				s3Seq:      0,
+			}
+			s.streams[sid] = st
+		} else {
+			if rec.StreamSeq > st.witnessSeq {
+				st.witnessSeq = rec.StreamSeq
+			}
+		}
+		s.tailHistory = append(s.tailHistory, rec)
+	}
+
+	// Start background group commit worker
+	s.wg.Add(1)
+	go s.groupCommitLoop()
+
+	// Start background flush worker
+	if cfg.FlushInterval > 0 {
+		s.wg.Add(1)
+		go s.periodicFlushLoop(cfg.FlushInterval)
+	}
+
+	return s, nil
+}
+
+// Close gracefully stops workers, flushes to permanent storage, and closes local stores.
+func (s *Server) Close() error {
+	close(s.stopChan)
+	s.wg.Wait()
+
+	var errs []error
+
+	// Perform a final flush on shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := s.flushInternal(ctx); err != nil {
+		klog.Warningf("Error during shutdown flush: %v", err)
+		errs = append(errs, err)
+	}
+
+	if s.localStore != nil {
+		if err := s.localStore.Close(); err != nil {
+			klog.Warningf("Error closing local store: %v", err)
+			errs = append(errs, err)
+		}
+	}
+	if s.tempDir != "" {
+		_ = os.RemoveAll(s.tempDir)
+	}
+	return errors.Join(errs...)
+}
+
+// LastPosition returns current lastPosition assigned by this buffer server.
+func (s *Server) LastPosition() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastPosition
+}
+
+// PositionFloor returns the reserved upper limit for position allocation.
+func (s *Server) PositionFloor() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.positionFloor
+}
+
+func (s *Server) getOrCreateStream(streamID uuid.UUID) *streamState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sid := streamID.String()
+	st, exists := s.streams[sid]
+	if !exists {
+		st = &streamState{
+			witnessSeq: 0,
+			s3Seq:      0,
+		}
+		s.streams[sid] = st
+	}
+	return st
+}
+
+// Append handles the bidirectional client append stream.
+func (s *Server) Append(stream pb.WalBuffer_AppendServer) error {
+	ctx := stream.Context()
+
+	// 1. First message MUST be Hello
+	firstReq, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	hello := firstReq.GetHello()
+	if hello == nil {
+		return status.Errorf(codes.InvalidArgument, "first message must be Hello")
+	}
+
+	if len(hello.StreamId) != 16 {
+		return status.Errorf(codes.InvalidArgument, "stream_id must be exactly 16 bytes")
+	}
+	var streamID uuid.UUID
+	copy(streamID[:], hello.StreamId)
+
+	st := s.getOrCreateStream(streamID)
+
+	s.mu.RLock()
+	witnessSeq := st.witnessSeq
+	s3Seq := st.s3Seq
+	s.mu.RUnlock()
+
+	// Deduped / single sender channel to prevent concurrent stream.Send calls
+	outCh := make(chan *pb.AppendResponse, 64)
+	sendErrCh := make(chan error, 1)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.stopChan:
+				return
+			case resp, ok := <-outCh:
+				if !ok {
+					return
+				}
+				if err := stream.Send(resp); err != nil {
+					select {
+					case sendErrCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	// Send initial HelloAck
+	select {
+	case outCh <- &pb.AppendResponse{
+		Msg: &pb.AppendResponse_HelloAck{
+			HelloAck: &pb.HelloAck{
+				WitnessAckedStreamSeq: witnessSeq,
+				S3AckedStreamSeq:      s3Seq,
+			},
+		},
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.stopChan:
+		return status.Errorf(codes.Unavailable, "server shutting down")
+	}
+
+	// Create channel for S3 acks notifications for this client
+	s3NotifyCh := make(chan struct{}, 10)
+	s.registerS3AckWaiter(s3NotifyCh)
+	defer s.unregisterS3AckWaiter(s3NotifyCh)
+
+	// Forward S3 acks notifications to outCh
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.stopChan:
+				return
+			case <-s3NotifyCh:
+				s.mu.RLock()
+				curWitness := st.witnessSeq
+				curS3 := st.s3Seq
+				s.mu.RUnlock()
+
+				select {
+				case outCh <- &pb.AppendResponse{
+					Msg: &pb.AppendResponse_Ack{
+						Ack: &pb.Ack{
+							WitnessAckedStreamSeq: curWitness,
+							S3AckedStreamSeq:      curS3,
+						},
+					},
+				}:
+				default:
+				}
+			}
+		}
+	}()
+
+	// Read loop for AppendRequest records
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		pbRec := req.GetRecord()
+		if pbRec == nil {
+			continue
+		}
+
+		s.mu.RLock()
+		curWitness := st.witnessSeq
+		curS3 := st.s3Seq
+		s.mu.RUnlock()
+
+		// Idempotency: duplicate records at or below witness watermark are acked and dropped
+		if pbRec.StreamSeq <= curWitness {
+			select {
+			case outCh <- &pb.AppendResponse{
+				Msg: &pb.AppendResponse_Ack{
+					Ack: &pb.Ack{
+						WitnessAckedStreamSeq: curWitness,
+						S3AckedStreamSeq:      curS3,
+					},
+				},
+			}:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-s.stopChan:
+				return status.Errorf(codes.Unavailable, "server shutting down")
+			}
+			continue
+		}
+
+		// Submit to group commit
+		ackChan := make(chan ackResult, 1)
+		select {
+		case s.incomingChan <- incomingItem{
+			streamID:  streamID,
+			streamSeq: pbRec.StreamSeq,
+			payload:   pbRec.Payload,
+			ackChan:   ackChan,
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopChan:
+			return status.Errorf(codes.Unavailable, "server shutting down")
+		case err := <-sendErrCh:
+			return err
+		}
+
+		// Wait for witness commit result
+		select {
+		case res := <-ackChan:
+			if res.err != nil {
+				return status.Errorf(codes.Internal, "commit failed: %v", res.err)
+			}
+			select {
+			case outCh <- &pb.AppendResponse{
+				Msg: &pb.AppendResponse_Ack{
+					Ack: &pb.Ack{
+						WitnessAckedStreamSeq: res.witnessSeq,
+						S3AckedStreamSeq:      res.s3Seq,
+					},
+				},
+			}:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-s.stopChan:
+				return status.Errorf(codes.Unavailable, "server shutting down")
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopChan:
+			return status.Errorf(codes.Unavailable, "server shutting down")
+		case err := <-sendErrCh:
+			return err
+		}
+	}
+}
+
+func (s *Server) groupCommitLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(s.cfg.BatchMaxDelay)
+	defer ticker.Stop()
+
+	var batch []incomingItem
+	var batchBytes int64
+
+	commitBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		s.commitItems(batch)
+		batch = nil
+		batchBytes = 0
+	}
+
+	for {
+		select {
+		case <-s.stopChan:
+			commitBatch()
+			return
+		case item := <-s.incomingChan:
+			itemBytes := int64(wal.LogHeaderSize + len(item.payload))
+			batch = append(batch, item)
+			batchBytes += itemBytes
+
+			if batchBytes >= s.cfg.BatchMaxSize {
+				commitBatch()
+			}
+		case <-ticker.C:
+			commitBatch()
+		}
+	}
+}
+
+func (s *Server) commitItems(items []incomingItem) {
+	if len(items) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if position reservation exhausted
+	if s.lastPosition+uint64(len(items)) >= s.positionFloor {
+		klog.Errorf("Position allocation reached floor limit (%d >= %d), forcing flush", s.lastPosition, s.positionFloor)
+		for _, item := range items {
+			item.ackChan <- ackResult{err: errors.New("position allocation limit reached, please retry after flush")}
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, _ = s.flushInternal(ctx)
+		}()
+		return
+	}
+
+	var recordsToStore []*wal.LogRecord
+
+	for _, item := range items {
+		s.lastPosition++
+		rec := &wal.LogRecord{
+			Position:  s.lastPosition,
+			StreamID:  item.streamID,
+			StreamSeq: item.streamSeq,
+			Payload:   item.payload,
+		}
+		rec.CRC32C = rec.ComputeCRC32C()
+		recordsToStore = append(recordsToStore, rec)
+	}
+
+	// 1. Write batch to local log segment store and fsync
+	if err := s.localStore.AppendBatch(recordsToStore); err != nil {
+		klog.Errorf("Failed writing batch to local log segment store: %v", err)
+		for _, item := range items {
+			item.ackChan <- ackResult{err: err}
+		}
+		return
+	}
+
+	// 2. Add to unflushed queue and tail cache
+	s.unflushedMu.Lock()
+	for _, rec := range recordsToStore {
+		s.unflushedRecords = append(s.unflushedRecords, rec)
+		s.unflushedBytes += int64(wal.LogHeaderSize + len(rec.Payload))
+	}
+	triggerFlush := s.unflushedBytes >= s.cfg.FlushBytes
+	s.unflushedMu.Unlock()
+
+	s.tailMu.Lock()
+	s.tailHistory = append(s.tailHistory, recordsToStore...)
+	for waiter := range s.tailWaiters {
+		select {
+		case waiter <- struct{}{}:
+		default:
+		}
+	}
+	s.tailMu.Unlock()
+
+	// 3. Update stream witness watermarks and send results
+	for i, item := range items {
+		rec := recordsToStore[i]
+		sid := rec.StreamID.String()
+		st := s.streams[sid]
+		if st == nil {
+			st = &streamState{
+				witnessSeq: rec.StreamSeq,
+				s3Seq:      0,
+			}
+			s.streams[sid] = st
+		} else {
+			if rec.StreamSeq > st.witnessSeq {
+				st.witnessSeq = rec.StreamSeq
+			}
+		}
+
+		item.ackChan <- ackResult{
+			witnessSeq: st.witnessSeq,
+			s3Seq:      st.s3Seq,
+		}
+	}
+
+	if triggerFlush {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, _ = s.flushInternal(ctx)
+		}()
+	}
+}
+
+// Flush RPC forces an S3 flush and returns once the manifest is durable.
+func (s *Server) Flush(ctx context.Context, req *pb.FlushRequest) (*pb.FlushResponse, error) {
+	return s.flushInternal(ctx)
+}
+
+func (s *Server) periodicFlushLoop(interval time.Duration) {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, _ = s.flushInternal(ctx)
+			cancel()
+		}
+	}
+}
+
+func (s *Server) flushInternal(ctx context.Context) (*pb.FlushResponse, error) {
+	s.flushMu.Lock()
+	for {
+		if s.isFlushing {
+			s.flushCond.Wait()
+			continue
+		}
+
+		s.unflushedMu.Lock()
+		if len(s.unflushedRecords) == 0 {
+			s.unflushedMu.Unlock()
+			s.flushMu.Unlock()
+			s.mu.RLock()
+			resp := &pb.FlushResponse{
+				LastPosition: s.lastPosition,
+			}
+			s.mu.RUnlock()
+			return resp, nil
+		}
+
+		recordsToFlush := s.unflushedRecords
+		s.unflushedRecords = nil
+		s.unflushedBytes = 0
+		s.unflushedMu.Unlock()
+
+		s.isFlushing = true
+		s.flushMu.Unlock()
+
+		err := s.doFlush(ctx, recordsToFlush)
+
+		s.flushMu.Lock()
+		s.isFlushing = false
+		if err == nil {
+			s.flushSeq++
+		} else {
+			s.unflushedMu.Lock()
+			s.unflushedRecords = append(recordsToFlush, s.unflushedRecords...)
+			for _, r := range recordsToFlush {
+				s.unflushedBytes += int64(wal.LogHeaderSize + len(r.Payload))
+			}
+			s.unflushedMu.Unlock()
+		}
+		s.flushCond.Broadcast()
+
+		if err != nil {
+			s.flushMu.Unlock()
+			return nil, err
+		}
+
+		// Check if new records arrived while doFlush was executing
+		s.unflushedMu.Lock()
+		unflushedLen := len(s.unflushedRecords)
+		s.unflushedMu.Unlock()
+		if unflushedLen == 0 {
+			s.flushMu.Unlock()
+			s.mu.RLock()
+			resp := &pb.FlushResponse{
+				LastPosition: s.lastPosition,
+			}
+			s.mu.RUnlock()
+			return resp, nil
+		}
+	}
+}
+
+func (s *Server) doFlush(ctx context.Context, records []*wal.LogRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	firstPos := records[0].Position
+	lastPos := records[len(records)-1].Position
+
+	// 1. Encode all records into segment byte buffer
+	var segBuf bytes.Buffer
+	streamMaxSeq := make(map[string]uint64)
+
+	for _, rec := range records {
+		encoded := rec.Encode()
+		segBuf.Write(encoded)
+		sid := rec.StreamID.String()
+		if rec.StreamSeq > streamMaxSeq[sid] {
+			streamMaxSeq[sid] = rec.StreamSeq
+		}
+	}
+
+	segPath := fmt.Sprintf("wal/segments/%012d-%012d.wal", firstPos, lastPos)
+	segStream := blob.NewByteStreamFromBytes(segBuf.Bytes())
+	defer segStream.Close()
+
+	// 2. Put segment object to object storage
+	if _, err := s.backend.PutObject(ctx, "", segPath, segStream); err != nil {
+		return fmt.Errorf("failed to upload segment %s: %w", segPath, err)
+	}
+
+	// 3. Update manifest
+	s.mu.Lock()
+	s.manifest.Segments = append(s.manifest.Segments, segPath)
+	if lastPos > s.manifest.LastPosition {
+		s.manifest.LastPosition = lastPos
+	}
+
+	newFloor := s.positionFloor
+	if s.positionFloor-s.lastPosition <= FloorBumpThreshold {
+		newFloor = s.positionFloor + PositionFloorStep
+		s.manifest.PositionFloor = newFloor
+	}
+
+	for sid, maxSeq := range streamMaxSeq {
+		s.manifest.Streams[sid] = StreamState{S3AckedStreamSeq: maxSeq}
+		if st, exists := s.streams[sid]; exists {
+			if maxSeq > st.s3Seq {
+				st.s3Seq = maxSeq
+			}
+		}
+	}
+
+	// 4. Save manifest to object storage
+	if err := SaveManifest(ctx, s.backend, s.manifest); err != nil {
+		// Revert manifest position floor on error so it stays consistent
+		s.manifest.PositionFloor = s.positionFloor
+		s.mu.Unlock()
+		return fmt.Errorf("failed to save manifest after flushing %s: %w", segPath, err)
+	}
+
+	// Make positionFloor visible in-memory ONLY after SaveManifest succeeds
+	if newFloor != s.positionFloor {
+		s.positionFloor = newFloor
+		klog.Infof("Durably bumped position floor to %d", s.positionFloor)
+	}
+	s.mu.Unlock()
+
+	// 5. Clean up local segment files
+	if err := s.localStore.DeleteSegmentsBeforeBytes(s.cfg.TailCacheBytes); err != nil {
+		klog.Warningf("Error cleaning local segment files: %v", err)
+	}
+
+	// 6. Broadcast S3 acks advance
+	s.broadcastS3Ack()
+
+	klog.Infof("Flushed WAL segment %s (%d records, %d bytes) to permanent storage", segPath, len(records), segBuf.Len())
+	return nil
+}
+
+type s3AckRegistry struct {
+	mu      sync.Mutex
+	waiters map[chan struct{}]struct{}
+}
+
+var globalS3AckRegistry = s3AckRegistry{
+	waiters: make(map[chan struct{}]struct{}),
+}
+
+func (s *Server) registerS3AckWaiter(ch chan struct{}) {
+	globalS3AckRegistry.mu.Lock()
+	globalS3AckRegistry.waiters[ch] = struct{}{}
+	globalS3AckRegistry.mu.Unlock()
+}
+
+func (s *Server) unregisterS3AckWaiter(ch chan struct{}) {
+	globalS3AckRegistry.mu.Lock()
+	delete(globalS3AckRegistry.waiters, ch)
+	globalS3AckRegistry.mu.Unlock()
+}
+
+func (s *Server) broadcastS3Ack() {
+	globalS3AckRegistry.mu.Lock()
+	defer globalS3AckRegistry.mu.Unlock()
+
+	for ch := range globalS3AckRegistry.waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Tail streams merged records in position order.
+func (s *Server) Tail(req *pb.TailRequest, stream pb.WalBuffer_TailServer) error {
+	ctx := stream.Context()
+	fromPos := req.FromPosition
+	if fromPos == 0 {
+		fromPos = 1
+	}
+
+	currentPos := fromPos
+
+	// 1. Check permanent storage segments if needed
+	s.mu.RLock()
+	segments := make([]string, len(s.manifest.Segments))
+	copy(segments, s.manifest.Segments)
+	s.mu.RUnlock()
+
+	for _, segPath := range segments {
+		_, segLast, err := wal.ParseSegmentPath(segPath)
+		if err != nil {
+			continue
+		}
+		if segLast < currentPos {
+			continue
+		}
+
+		records, err := ReadSegmentFromBackend(ctx, s.backend, segPath)
+		if err != nil {
+			klog.Warningf("Tail failed to read segment %s: %v", segPath, err)
+			continue
+		}
+
+		for _, rec := range records {
+			if rec.Position >= currentPos {
+				if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+					return err
+				}
+				currentPos = rec.Position + 1
+			}
+		}
+	}
+
+	// 2. Stream from memory tail cache and live incoming records
+	waitChan := make(chan struct{}, 10)
+	s.tailMu.Lock()
+	s.tailWaiters[waitChan] = struct{}{}
+	s.tailMu.Unlock()
+	defer func() {
+		s.tailMu.Lock()
+		delete(s.tailWaiters, waitChan)
+		s.tailMu.Unlock()
+	}()
+
+	for {
+		s.tailMu.RLock()
+		records := make([]*wal.LogRecord, 0, len(s.tailHistory))
+		for _, r := range s.tailHistory {
+			if r.Position >= currentPos {
+				records = append(records, r)
+			}
+		}
+		s.tailMu.RUnlock()
+
+		for _, rec := range records {
+			if rec.Position >= currentPos {
+				if err := stream.Send(&pb.TailResponse{Record: rec.ToProto()}); err != nil {
+					return err
+				}
+				currentPos = rec.Position + 1
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopChan:
+			return nil
+		case <-waitChan:
+		}
+	}
+}
