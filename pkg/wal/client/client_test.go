@@ -512,3 +512,128 @@ func TestFlushFlushesAfterWitness(t *testing.T) {
 		t.Fatalf("expected permanent watermark 5, got %d", permanent)
 	}
 }
+
+// 9. Two servers in one process: a flush on server A must not produce an ack on server B's stream.
+func TestTwoServersFlushIsolation(t *testing.T) {
+	backendA := controller.NewMemoryBackend()
+	handleA := startBufferServer(t, backendA, t.TempDir())
+	defer handleA.StopGraceful()
+
+	backendB := controller.NewMemoryBackend()
+	handleB := startBufferServer(t, backendB, t.TempDir())
+	defer handleB.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	streamA, err := Open(ctx, t.TempDir(), uuid.New(), handleA.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream A: %v", err)
+	}
+	defer streamA.Close()
+
+	streamB, err := Open(ctx, t.TempDir(), uuid.New(), handleB.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream B: %v", err)
+	}
+	defer streamB.Close()
+
+	seqA, err := streamA.Append(ctx, []byte("dataA"))
+	if err != nil {
+		t.Fatalf("append A failed: %v", err)
+	}
+	if err := streamA.Wait(ctx, seqA, Witness, false); err != nil {
+		t.Fatalf("wait witness A failed: %v", err)
+	}
+
+	seqB, err := streamB.Append(ctx, []byte("dataB"))
+	if err != nil {
+		t.Fatalf("append B failed: %v", err)
+	}
+	if err := streamB.Wait(ctx, seqB, Witness, false); err != nil {
+		t.Fatalf("wait witness B failed: %v", err)
+	}
+
+	// Flush server A
+	if err := streamA.Flush(ctx); err != nil {
+		t.Fatalf("flush A failed: %v", err)
+	}
+
+	_, _, permA := streamA.Watermarks()
+	if permA != 1 {
+		t.Fatalf("expected permanent watermark 1 on stream A, got %d", permA)
+	}
+
+	// Give time for any unexpected notification to arrive on stream B
+	time.Sleep(100 * time.Millisecond)
+
+	_, _, permB := streamB.Watermarks()
+	if permB != 0 {
+		t.Fatalf("expected permanent watermark 0 on stream B after server A flush, got %d", permB)
+	}
+}
+
+// 10. Two streams on one server: a flush containing records from only one advances only that stream's permanent watermark.
+func TestTwoStreamsOneServerFlushIsolation(t *testing.T) {
+	backend := controller.NewMemoryBackend()
+	handle := startBufferServer(t, backend, t.TempDir())
+	defer handle.StopGraceful()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	stream1, err := Open(ctx, t.TempDir(), uuid.New(), handle.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream 1: %v", err)
+	}
+	defer stream1.Close()
+
+	stream2, err := Open(ctx, t.TempDir(), uuid.New(), handle.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream 2: %v", err)
+	}
+	defer stream2.Close()
+
+	// Initial append on both and flush both
+	seq1, _ := stream1.Append(ctx, []byte("s1-1"))
+	_ = stream1.Wait(ctx, seq1, Witness, false)
+	seq2, _ := stream2.Append(ctx, []byte("s2-1"))
+	_ = stream2.Wait(ctx, seq2, Witness, false)
+
+	if err := stream1.Flush(ctx); err != nil {
+		t.Fatalf("initial flush failed: %v", err)
+	}
+	_ = stream2.Wait(ctx, seq2, Permanent, false)
+
+	_, _, perm1 := stream1.Watermarks()
+	_, _, perm2 := stream2.Watermarks()
+	if perm1 != 1 || perm2 != 1 {
+		t.Fatalf("expected perm1=1, perm2=1; got perm1=%d, perm2=%d", perm1, perm2)
+	}
+
+	// Append record 2 only to stream 1
+	seq1_2, err := stream1.Append(ctx, []byte("s1-2"))
+	if err != nil {
+		t.Fatalf("append s1-2 failed: %v", err)
+	}
+	if err := stream1.Wait(ctx, seq1_2, Witness, false); err != nil {
+		t.Fatalf("wait witness s1-2 failed: %v", err)
+	}
+
+	// Flush server (only stream 1 has unflushed records)
+	if err := stream1.Flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	_, _, perm1After := stream1.Watermarks()
+	if perm1After != 2 {
+		t.Fatalf("expected perm1=2 after flush, got %d", perm1After)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	_, _, perm2After := stream2.Watermarks()
+	if perm2After != 1 {
+		t.Fatalf("expected perm2=1 to remain unchanged, got %d", perm2After)
+	}
+}

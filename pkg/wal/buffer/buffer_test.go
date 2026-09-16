@@ -669,3 +669,244 @@ func TestRestartOnPersistentDataDir(t *testing.T) {
 	}
 	_ = srv2
 }
+
+func recvAppendResponseWithTimeout(t *testing.T, stream pb.WalBuffer_AppendClient, timeout time.Duration) (*pb.AppendResponse, error) {
+	respCh := make(chan *pb.AppendResponse, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := stream.Recv()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+	select {
+	case resp := <-respCh:
+		return resp, nil
+	case err := <-errCh:
+		return nil, err
+	case <-time.After(timeout):
+		return nil, errors.New("recv timeout")
+	}
+}
+
+func TestFlushIsolationAcrossServers(t *testing.T) {
+	backendA := controller.NewMemoryBackend()
+	srvA, addrA, cleanupA := startTestServer(t, backendA, t.TempDir())
+	defer cleanupA()
+
+	backendB := controller.NewMemoryBackend()
+	srvB, addrB, cleanupB := startTestServer(t, backendB, t.TempDir())
+	defer cleanupB()
+
+	connA, err := grpc.NewClient(addrA, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial A failed: %v", err)
+	}
+	defer connA.Close()
+
+	connB, err := grpc.NewClient(addrB, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial B failed: %v", err)
+	}
+	defer connB.Close()
+
+	clientA := pb.NewWalBufferClient(connA)
+	streamA, err := clientA.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream A: %v", err)
+	}
+
+	clientB := pb.NewWalBufferClient(connB)
+	streamB, err := clientB.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream B: %v", err)
+	}
+
+	streamIDA := uuid.New()
+	streamIDB := uuid.New()
+
+	// 1. Handshake A and B
+	if err := streamA.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{
+				StreamId: streamIDA[:],
+			},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send hello A: %v", err)
+	}
+	if _, err := streamA.Recv(); err != nil {
+		t.Fatalf("failed to recv hello ack A: %v", err)
+	}
+
+	if err := streamB.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{
+			Hello: &pb.Hello{
+				StreamId: streamIDB[:],
+			},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send hello B: %v", err)
+	}
+	if _, err := streamB.Recv(); err != nil {
+		t.Fatalf("failed to recv hello ack B: %v", err)
+	}
+
+	// 2. Append records on both
+	if err := streamA.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{
+			Record: &pb.AppendRecord{
+				StreamSeq: 1,
+				Payload:   []byte("serverA-data"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send record A: %v", err)
+	}
+	ackA, err := streamA.Recv()
+	if err != nil || ackA.GetAck() == nil || ackA.GetAck().WitnessAckedStreamSeq != 1 {
+		t.Fatalf("unexpected ack A: %+v, err: %v", ackA, err)
+	}
+
+	if err := streamB.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{
+			Record: &pb.AppendRecord{
+				StreamSeq: 1,
+				Payload:   []byte("serverB-data"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send record B: %v", err)
+	}
+	ackB, err := streamB.Recv()
+	if err != nil || ackB.GetAck() == nil || ackB.GetAck().WitnessAckedStreamSeq != 1 {
+		t.Fatalf("unexpected ack B: %+v, err: %v", ackB, err)
+	}
+
+	// 3. Flush ONLY server A
+	_, err = clientA.Flush(t.Context(), &pb.FlushRequest{})
+	if err != nil {
+		t.Fatalf("flush server A failed: %v", err)
+	}
+
+	// Stream A must receive S3 ack
+	flushAckA, err := recvAppendResponseWithTimeout(t, streamA, 1*time.Second)
+	if err != nil {
+		t.Fatalf("stream A did not receive S3 ack after flush: %v", err)
+	}
+	if flushAckA.GetAck() == nil || flushAckA.GetAck().S3AckedStreamSeq != 1 {
+		t.Fatalf("expected S3AckedStreamSeq 1 on stream A, got %+v", flushAckA)
+	}
+
+	// Stream B must NOT receive any message
+	respB, err := recvAppendResponseWithTimeout(t, streamB, 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("stream B received unexpected message when server A flushed: %+v", respB)
+	}
+	_ = srvA
+	_ = srvB
+}
+
+func TestFlushIsolationAcrossStreams(t *testing.T) {
+	backend := controller.NewMemoryBackend()
+	srv, addr, cleanup := startTestServer(t, backend, t.TempDir())
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewWalBufferClient(conn)
+
+	stream1, err := client.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream 1: %v", err)
+	}
+	stream2, err := client.Append(t.Context())
+	if err != nil {
+		t.Fatalf("failed to start stream 2: %v", err)
+	}
+
+	streamID1 := uuid.New()
+	streamID2 := uuid.New()
+
+	// 1. Handshake both streams
+	if err := stream1.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID1[:]}},
+	}); err != nil {
+		t.Fatalf("failed to send hello 1: %v", err)
+	}
+	if _, err := stream1.Recv(); err != nil {
+		t.Fatalf("failed to recv hello ack 1: %v", err)
+	}
+
+	if err := stream2.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Hello{Hello: &pb.Hello{StreamId: streamID2[:]}},
+	}); err != nil {
+		t.Fatalf("failed to send hello 2: %v", err)
+	}
+	if _, err := stream2.Recv(); err != nil {
+		t.Fatalf("failed to recv hello ack 2: %v", err)
+	}
+
+	// 2. Append record 1 on both streams
+	_ = stream1.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 1, Payload: []byte("s1-1")}},
+	})
+	ack1, err := stream1.Recv()
+	if err != nil || ack1.GetAck() == nil || ack1.GetAck().WitnessAckedStreamSeq != 1 {
+		t.Fatalf("unexpected ack 1: %+v, err: %v", ack1, err)
+	}
+
+	_ = stream2.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 1, Payload: []byte("s2-1")}},
+	})
+	ack2, err := stream2.Recv()
+	if err != nil || ack2.GetAck() == nil || ack2.GetAck().WitnessAckedStreamSeq != 1 {
+		t.Fatalf("unexpected ack 2: %+v, err: %v", ack2, err)
+	}
+
+	// 3. Flush server -> both streams get S3 ack for seq 1
+	if _, err := client.Flush(t.Context(), &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	s3Ack1, err := recvAppendResponseWithTimeout(t, stream1, 1*time.Second)
+	if err != nil || s3Ack1.GetAck() == nil || s3Ack1.GetAck().S3AckedStreamSeq != 1 {
+		t.Fatalf("expected s3 ack 1 on stream 1, got %+v, err: %v", s3Ack1, err)
+	}
+	s3Ack2, err := recvAppendResponseWithTimeout(t, stream2, 1*time.Second)
+	if err != nil || s3Ack2.GetAck() == nil || s3Ack2.GetAck().S3AckedStreamSeq != 1 {
+		t.Fatalf("expected s3 ack 1 on stream 2, got %+v, err: %v", s3Ack2, err)
+	}
+
+	// 4. Append record 2 ONLY on stream 1
+	_ = stream1.Send(&pb.AppendRequest{
+		Msg: &pb.AppendRequest_Record{Record: &pb.AppendRecord{StreamSeq: 2, Payload: []byte("s1-2")}},
+	})
+	ack1_2, err := stream1.Recv()
+	if err != nil || ack1_2.GetAck() == nil || ack1_2.GetAck().WitnessAckedStreamSeq != 2 {
+		t.Fatalf("unexpected ack 1_2: %+v, err: %v", ack1_2, err)
+	}
+
+	// 5. Flush server (containing records ONLY from stream 1)
+	if _, err := client.Flush(t.Context(), &pb.FlushRequest{}); err != nil {
+		t.Fatalf("flush 2 failed: %v", err)
+	}
+
+	// Stream 1 MUST receive S3 ack for seq 2
+	flushAck1, err := recvAppendResponseWithTimeout(t, stream1, 1*time.Second)
+	if err != nil || flushAck1.GetAck() == nil || flushAck1.GetAck().S3AckedStreamSeq != 2 {
+		t.Fatalf("expected S3AckedStreamSeq 2 on stream 1, got %+v, err: %v", flushAck1, err)
+	}
+
+	// Stream 2 MUST NOT receive any ack
+	resp2, err := recvAppendResponseWithTimeout(t, stream2, 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("stream 2 received unexpected message when stream 1 flushed: %+v", resp2)
+	}
+	_ = srv
+}
