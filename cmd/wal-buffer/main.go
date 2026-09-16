@@ -92,7 +92,7 @@ func main() {
 		grpcServer.GracefulStop()
 	}()
 
-	klog.Infof("WAL Buffer Service listening on port %d (last_position=%d, position_floor=%d, backend=%s, data-dir=%s)", *port, srv.LastPosition(), srv.PositionFloor(), *backendType, *dataDir)
+	klog.Infof("WAL Buffer Service listening on port %d (last_position=%d, backend=%s, data-dir=%s)", *port, srv.LastPosition(), *backendType, *dataDir)
 	if err := grpcServer.Serve(listener); err != nil {
 		klog.Fatalf("failed to serve: %v", err)
 	}

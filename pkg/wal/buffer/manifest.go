@@ -29,12 +29,6 @@ import (
 
 const (
 	ManifestKey = "wal/manifest.json"
-
-	// PositionFloorStep is 2^32 (4294967296).
-	PositionFloorStep uint64 = 1 << 32
-
-	// FloorBumpThreshold is 2^31 (2147483648).
-	FloorBumpThreshold uint64 = 1 << 31
 )
 
 // StreamState holds the persisted state of a single stream in the manifest.
@@ -44,10 +38,9 @@ type StreamState struct {
 
 // Manifest represents the S3 WAL manifest (wal/manifest.json).
 type Manifest struct {
-	Segments      []string               `json:"segments"`
-	LastPosition  uint64                 `json:"last_position"`
-	PositionFloor uint64                 `json:"position_floor"`
-	Streams       map[string]StreamState `json:"streams"`
+	Segments     []string               `json:"segments"`
+	LastPosition uint64                 `json:"last_position"`
+	Streams      map[string]StreamState `json:"streams"`
 }
 
 // LoadManifest reads wal/manifest.json from the backend. If it does not exist, returns an empty Manifest.
@@ -56,19 +49,17 @@ func LoadManifest(ctx context.Context, backend blob.ObjectStorageBackend) (*Mani
 	err := backend.GetObject(ctx, "", ManifestKey, 0, 0, &buf)
 	if err != nil {
 		return &Manifest{
-			Segments:      nil,
-			LastPosition:  0,
-			PositionFloor: 0,
-			Streams:       make(map[string]StreamState),
+			Segments:     nil,
+			LastPosition: 0,
+			Streams:      make(map[string]StreamState),
 		}, nil
 	}
 
 	if buf.Len() == 0 {
 		return &Manifest{
-			Segments:      nil,
-			LastPosition:  0,
-			PositionFloor: 0,
-			Streams:       make(map[string]StreamState),
+			Segments:     nil,
+			LastPosition: 0,
+			Streams:      make(map[string]StreamState),
 		}, nil
 	}
 
