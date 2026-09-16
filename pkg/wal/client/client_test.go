@@ -145,8 +145,8 @@ func TestAppendWitnessAndPermanentAck(t *testing.T) {
 }
 
 // 2. Buffer service restarted (ungracefully without flush) with empty data dir:
-// Client reconnects, replays un-permanently-acked records, restarted buffer assigns positions >= position_floor,
-// and Tail returns all records with no position reused.
+// Client reconnects, replays un-permanently-acked records, restarted buffer assigns positions starting at last_position + 1,
+// all witness-acked records reappear via Tail, and a Tail resumed from a provisional cursor is clamped and reports resumed_from.
 func TestBufferServiceRestartWithoutClose(t *testing.T) {
 	backend := controller.NewMemoryBackend()
 	handle1 := startBufferServer(t, backend, t.TempDir())
@@ -194,9 +194,9 @@ func TestBufferServiceRestartWithoutClose(t *testing.T) {
 	handle2 := startBufferServer(t, backend, t.TempDir())
 	defer handle2.StopGraceful()
 
-	// Check that restarted server position allocation starts at >= position_floor of incarnation 1
-	if handle2.srv.PositionFloor() <= handle1.srv.PositionFloor() {
-		t.Fatalf("expected restarted server position_floor to be > first server position_floor")
+	// Check that restarted server position allocation starts at last_position + 1 (5 + 1 = 6)
+	if handle2.srv.LastPosition() != 5 {
+		t.Fatalf("expected restarted server last_position to be 5, got %d", handle2.srv.LastPosition())
 	}
 
 	// Connect client to new server
@@ -211,7 +211,7 @@ func TestBufferServiceRestartWithoutClose(t *testing.T) {
 		t.Fatalf("failed waiting for witness ack after restart: %v", err)
 	}
 
-	// Tail from position 1
+	// 1. Tail from position 1
 	conn, err := grpc.NewClient(handle2.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -235,6 +235,9 @@ func TestBufferServiceRestartWithoutClose(t *testing.T) {
 		if err != nil {
 			t.Fatalf("tail recv %d failed: %v", i, err)
 		}
+		if i == 1 && resp.ResumedFrom != 1 {
+			t.Errorf("expected ResumedFrom 1 on first response, got %d", resp.ResumedFrom)
+		}
 		if positionsSeen[resp.Record.Position] {
 			t.Fatalf("duplicate position %d detected in Tail!", resp.Record.Position)
 		}
@@ -252,9 +255,170 @@ func TestBufferServiceRestartWithoutClose(t *testing.T) {
 			t.Errorf("expected stream_seq %d in tailed records, but was missing", i)
 		}
 	}
+
+	// 2. Tail with a provisional cursor (e.g. from_position=11, above last_position+1=6)
+	// Must be clamped to 6 and report resumed_from=6
+	tailStreamClamped, err := client.Tail(tailCtx, &pb.TailRequest{FromPosition: 11})
+	if err != nil {
+		t.Fatalf("tail clamped failed: %v", err)
+	}
+	firstResp, err := tailStreamClamped.Recv()
+	if err != nil {
+		t.Fatalf("tail clamped recv failed: %v", err)
+	}
+	if firstResp.ResumedFrom != 6 {
+		t.Errorf("expected resumed_from clamped to 6, got %d", firstResp.ResumedFrom)
+	}
+	if firstResp.Record.Position != 6 {
+		t.Errorf("expected first record at position 6, got %d", firstResp.Record.Position)
+	}
 }
 
-// 3. Client restarted mid-stream: retained records replayed, duplicates dropped, no gaps in stream_seq.
+// 3. A consumer tails through a crash, keeps a (stream_id -> max stream_seq) map,
+// reconnects with its old cursor, and ends up with exactly one copy of every record.
+func TestConsumerTailThroughCrashWithDedup(t *testing.T) {
+	backend := controller.NewMemoryBackend()
+	handle1 := startBufferServer(t, backend, t.TempDir())
+
+	clientDir := t.TempDir()
+	streamID := uuid.New()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	stream, err := Open(ctx, clientDir, streamID, handle1.addr)
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	defer stream.Close()
+
+	// Append 5 records and flush to permanent storage
+	for i := 1; i <= 5; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("record-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness %d failed: %v", seq, err)
+		}
+	}
+	if err := stream.Flush(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	// Append 5 more records (witness only, unflushed)
+	for i := 6; i <= 10; i++ {
+		seq, err := stream.Append(ctx, []byte(fmt.Sprintf("record-%d", i)))
+		if err != nil {
+			t.Fatalf("append %d failed: %v", i, err)
+		}
+		if err := stream.Wait(ctx, seq, Witness, false); err != nil {
+			t.Fatalf("wait witness %d failed: %v", seq, err)
+		}
+	}
+
+	// Consumer tails all 10 records from incarnation 1
+	conn1, err := grpc.NewClient(handle1.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn1.Close()
+
+	client1 := pb.NewWalBufferClient(conn1)
+	tailStream1, err := client1.Tail(ctx, &pb.TailRequest{FromPosition: 1})
+	if err != nil {
+		t.Fatalf("tail failed: %v", err)
+	}
+
+	var consumerReceivedRecords []*pb.LogRecord
+	streamMaxSeq := make(map[string]uint64)
+	var lastSeenPosition uint64
+
+	for i := 1; i <= 10; i++ {
+		resp, err := tailStream1.Recv()
+		if err != nil {
+			t.Fatalf("recv %d failed: %v", i, err)
+		}
+		rec := resp.Record
+		lastSeenPosition = rec.Position
+		sid := uuid.UUID(rec.StreamId).String()
+		if rec.StreamSeq > streamMaxSeq[sid] {
+			streamMaxSeq[sid] = rec.StreamSeq
+			consumerReceivedRecords = append(consumerReceivedRecords, rec)
+		}
+	}
+
+	// Consumer cursor is now lastSeenPosition + 1 = 11 (pointing into provisional range of incarnation 1)
+	consumerCursor := lastSeenPosition + 1
+
+	// Crash stop server 1
+	handle1.StopWithoutClose()
+
+	// Start server 2 (incarnation 2)
+	handle2 := startBufferServer(t, backend, t.TempDir())
+	defer handle2.StopGraceful()
+
+	// Client reconnects to server 2 and replays unflushed records 6..10
+	stream2, err := Open(ctx, clientDir, streamID, handle2.addr)
+	if err != nil {
+		t.Fatalf("failed to reopen client stream: %v", err)
+	}
+	defer stream2.Close()
+
+	if err := stream2.Wait(ctx, 10, Witness, false); err != nil {
+		t.Fatalf("failed waiting for witness ack on restart: %v", err)
+	}
+
+	// Consumer reconnects to server 2 using its old cursor (11)
+	conn2, err := grpc.NewClient(handle2.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	defer conn2.Close()
+
+	client2 := pb.NewWalBufferClient(conn2)
+	tailStream2, err := client2.Tail(ctx, &pb.TailRequest{FromPosition: consumerCursor})
+	if err != nil {
+		t.Fatalf("tail 2 failed: %v", err)
+	}
+
+	// Server 2 clamps cursor 11 to manifest.last_position + 1 = 6, returning resumed_from = 6
+	// and re-delivers records 6..10.
+	var redeliveredCount int
+	for i := 1; i <= 5; i++ {
+		resp, err := tailStream2.Recv()
+		if err != nil {
+			t.Fatalf("recv on reconnect %d failed: %v", i, err)
+		}
+		if i == 1 && resp.ResumedFrom != 6 {
+			t.Errorf("expected resumed_from clamped to 6, got %d", resp.ResumedFrom)
+		}
+		rec := resp.Record
+		sid := uuid.UUID(rec.StreamId).String()
+		if rec.StreamSeq > streamMaxSeq[sid] {
+			streamMaxSeq[sid] = rec.StreamSeq
+			consumerReceivedRecords = append(consumerReceivedRecords, rec)
+		} else {
+			redeliveredCount++
+		}
+	}
+
+	if redeliveredCount != 5 {
+		t.Errorf("expected 5 redelivered duplicate records, got %d", redeliveredCount)
+	}
+
+	// Verify consumer has exactly 10 unique records in order 1..10
+	if len(consumerReceivedRecords) != 10 {
+		t.Fatalf("expected exactly 10 deduplicated records, got %d", len(consumerReceivedRecords))
+	}
+	for i, rec := range consumerReceivedRecords {
+		expectedSeq := uint64(i + 1)
+		if rec.StreamSeq != expectedSeq {
+			t.Errorf("record %d: expected stream_seq %d, got %d", i, expectedSeq, rec.StreamSeq)
+		}
+	}
+}
+
+// 4. Client restarted mid-stream: retained records replayed, duplicates dropped, no gaps in stream_seq.
 func TestClientRestartMidStream(t *testing.T) {
 	backend := controller.NewMemoryBackend()
 	handle := startBufferServer(t, backend, t.TempDir())
