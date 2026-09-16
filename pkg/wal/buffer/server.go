@@ -28,6 +28,7 @@ import (
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -45,7 +46,7 @@ const (
 
 // ServerConfig configures the WAL Buffer service.
 type ServerConfig struct {
-	Backend        blob.ObjectStorageBackend
+	Backend        objectstore.Backend
 	DataDir        string
 	FlushInterval  time.Duration
 	FlushBytes     int64
@@ -88,7 +89,7 @@ type Server struct {
 	pb.UnimplementedWalBufferServer
 
 	cfg     ServerConfig
-	backend blob.ObjectStorageBackend
+	backend objectstore.Backend
 
 	mu           sync.RWMutex
 	lastPosition uint64

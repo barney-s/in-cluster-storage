@@ -51,14 +51,19 @@ spec:
             - "--v=5"
             - "--port=50051"
             - "--data-dir=/data"
+            - "--backend=file:///store"
           ports:
             - containerPort: 50051
               name: grpc
           volumeMounts:
             - name: data-dir
               mountPath: /data
+            - name: store-dir
+              mountPath: /store
       volumes:
         - name: data-dir
+          emptyDir: {}
+        - name: store-dir
           emptyDir: {}
 
 ---

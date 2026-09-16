@@ -24,6 +24,7 @@ import (
 	"io"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal"
 )
 
@@ -44,7 +45,7 @@ type Manifest struct {
 }
 
 // LoadManifest reads wal/manifest.json from the backend. If it does not exist, returns an empty Manifest.
-func LoadManifest(ctx context.Context, backend blob.ObjectStorageBackend) (*Manifest, error) {
+func LoadManifest(ctx context.Context, backend objectstore.Backend) (*Manifest, error) {
 	var buf bytes.Buffer
 	err := backend.GetObject(ctx, "", ManifestKey, 0, 0, &buf)
 	if err != nil {
@@ -74,7 +75,7 @@ func LoadManifest(ctx context.Context, backend blob.ObjectStorageBackend) (*Mani
 }
 
 // SaveManifest writes wal/manifest.json to the backend.
-func SaveManifest(ctx context.Context, backend blob.ObjectStorageBackend, m *Manifest) error {
+func SaveManifest(ctx context.Context, backend objectstore.Backend, m *Manifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal manifest: %w", err)
@@ -90,7 +91,7 @@ func SaveManifest(ctx context.Context, backend blob.ObjectStorageBackend, m *Man
 }
 
 // ReadSegmentFromBackend reads and decodes all LogRecords from a segment path in object storage.
-func ReadSegmentFromBackend(ctx context.Context, backend blob.ObjectStorageBackend, segPath string) ([]*wal.LogRecord, error) {
+func ReadSegmentFromBackend(ctx context.Context, backend objectstore.Backend, segPath string) ([]*wal.LogRecord, error) {
 	var buf bytes.Buffer
 	if err := backend.GetObject(ctx, "", segPath, 0, 0, &buf); err != nil {
 		return nil, fmt.Errorf("failed to fetch segment %s: %w", segPath, err)

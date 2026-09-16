@@ -27,8 +27,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/in-cluster-storage/pkg/api/wal/v1alpha1"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/blob"
-	"github.com/gke-labs/in-cluster-storage/pkg/objectfs/controller"
+	"github.com/gke-labs/in-cluster-storage/pkg/objectstore"
 	"github.com/gke-labs/in-cluster-storage/pkg/wal/buffer"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -37,7 +36,7 @@ import (
 var (
 	port           = flag.Int("port", 50051, "gRPC server port")
 	dataDir        = flag.String("data-dir", "/data", "Local directory for caching WAL segments")
-	backendType    = flag.String("backend", "memory", "Object storage backend type (currently 'memory' is supported; S3/GCS backend is in development)")
+	backendType    = flag.String("backend", "memory://", "Object storage backend URL (e.g. memory://, file:///path, s3://bucket/prefix, gs://bucket/prefix)")
 	flushInterval  = flag.Duration("flush-interval", 60*time.Second, "Periodic flush interval to backend object storage")
 	flushBytes     = flag.Int64("flush-bytes", 64*1024*1024, "Unflushed bytes threshold to trigger S3 flush")
 	tailCacheBytes = flag.Int64("tail-cache-bytes", 64*1024*1024, "Retained bytes in local cache for tailing")
@@ -55,13 +54,9 @@ func main() {
 	}
 
 	ctx := context.Background()
-	var backend blob.ObjectStorageBackend
-	switch *backendType {
-	case "memory":
-		// Note: MemoryBackend resides in process RAM. In production, an S3/GCS durable backend will be used.
-		backend = controller.NewMemoryBackend()
-	default:
-		klog.Fatalf("unsupported backend %q", *backendType)
+	backend, err := objectstore.Open(ctx, *backendType)
+	if err != nil {
+		klog.Fatalf("failed to initialize backend %q: %v", *backendType, err)
 	}
 
 	cfg := buffer.ServerConfig{
