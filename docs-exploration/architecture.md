@@ -75,3 +75,33 @@ sequenceDiagram
     Server-->>Pod: Send "OK <size>\n" + FD via SCM_RIGHTS (Ancillary OOB data)
     Note over Pod: Read file directly using the received FD (Zero-Copy)
 ```
+
+---
+
+## 4. WAL Buffer (Segmented Record Streaming & Cloud Flush)
+
+The WAL Buffer subsystem provides high-performance, low-latency write-ahead log buffering, committing to fast local storage before flushing to cloud object storage.
+
+```mermaid
+sequenceDiagram
+    participant Client as WAL Client
+    participant Server as wal-buffer Daemon
+    participant S3 as GCS / S3 Storage
+
+    Client->>Server: Append(stream Hello)
+    Server-->>Client: AppendResponse(HelloAck)
+
+    Client->>Server: Append(stream AppendRecord)
+    Server->>Server: Write to local log segment (Witness Ack)
+    Server-->>Client: AppendResponse(Ack - witness_acked_stream_seq)
+
+    Note over Server: Async Flush (Interval/Size) or Flush RPC
+    Server->>S3: Upload closed log segments & write updated Manifest
+    Server-->>Client: AppendResponse(Ack - s3_acked_stream_seq)
+```
+
+### Key Lifecycle Flows:
+* **Append Streaming (`Append`)**: Bidirectional gRPC streams allow clients to write sequential records. The server persists them immediately to local, fast SSD segments (`witness` log) for ultra-low latency, and returns local confirmation.
+* **Asynchronous Flushing (`Flush`)**: A background worker uploads local log segments to cloud storage and publishes a new manifest, at which point the server returns the permanent `s3_acked` sequence to the stream clients.
+* **Streaming Consumers (`Tail`)**: Clients tail the log from a specified position. Unflushed records are provisional; if a client disconnects and reconnects, they resume from the last flushed position and deduplicate redelivered records in-memory using `(stream_id, stream_seq)`.
+

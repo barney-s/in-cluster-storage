@@ -20,3 +20,10 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **User-Space Event Limits:** For large volumes containing tens of thousands of files, hybrid lazy-loading relies on monitoring file open events (`FAN_OPEN_PERM`) via `fanotify`.
   * *Question:* At what scale (number of active pods or open file handles) does the single-threaded context-switching overhead of user-space `fanotify` interception become a bottleneck?
   * *Question:* Are there specific Linux kernel minimum requirements or kernel config flags (other than standard `fanotify` support) needed to guarantee compatibility across diverse cloud-provider host kernels (e.g., Bottlerocket, COS, Ubuntu)?
+
+---
+
+## 4. ObjectFS Multi-Writer Consistency
+* **Strict POSIX and Write Consistency:** ObjectFS embraces eventual write consistency through a 3-tier local buffering design and periodic background backend flushing.
+  * *Question:* For distributed workloads or databases that require read-after-write or strong lock-based consistency across nodes, are there plans to introduce synchronous flush overrides, transactional writes, or standard POSIX file locking (`flock`), or is ObjectFS positioned solely for loose-consistency / read-heavy use cases?
+
