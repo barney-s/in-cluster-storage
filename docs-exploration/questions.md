@@ -33,3 +33,9 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **Lack of Standalone Manifest File:** Currently, CAS is deployed during E2E tests using inline manifests in `tests/e2e/cas_e2e_test.go`, but unlike AgentFS (`k8s/manifest.yaml`) and ObjectFS (`k8s/objectfs.yaml`), it does not have a dedicated `k8s/cas.yaml` file.
   * *Question:* Should we export and maintain a standard standalone CAS deployment manifest inside the `k8s/` folder for consistency and ease of manual deployment?
 
+---
+
+## 6. Local Development ImagePullPolicy with `ap deploy`
+* **Image Pull Failure on Local Clusters:** The deployment manifests in `k8s/` use the `:latest` image tag without specifying an `imagePullPolicy`. When loaded into local `kind` clusters, Kubernetes defaults to `imagePullPolicy: Always` for `:latest` tags, causing `ImagePullBackOff` as it attempts to pull from a remote registry.
+  * *Question:* Can `ap deploy` be configured to dynamically inject/override `imagePullPolicy: Never` or `imagePullPolicy: IfNotPresent` when targeting local clusters with `--skip-push`, or should developers continue to manually patch/rewrite the manifests before deployment?
+
