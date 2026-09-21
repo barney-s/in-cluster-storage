@@ -4,7 +4,8 @@ This directory houses living, developer-oriented documentation outlining the cor
 
 ## Index
 
-*   [Recent Activity (Sept 21, 2026)](activity/2026-09-21.md) — Summary of major themes, code churn, and key merges over the last month. *(Freshest)*
+*   [Deployment Runbook](runbooks/deploy.md) — Executable step-by-step instructions to build, deploy, verify, and teardown the storage subsystems. *(Freshest)*
+*   [Recent Activity (Sept 21, 2026)](activity/2026-09-21.md) — Summary of major themes, code churn, and key merges over the last month.
 *   [Open Questions](questions.md) — Unresolved architectural ambiguities, scaling challenges, and future design paths.
 *   [Code Map](code-map.md) — Layout of directories, 20 most critical source files, and "Danger Zone" files sensitive to edits.
 *   [Architecture](architecture.md) — Structural blueprints and Mermaid data-flow sequence/component diagrams for each subsystem.

@@ -27,3 +27,9 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **Strict POSIX and Write Consistency:** ObjectFS embraces eventual write consistency through a 3-tier local buffering design and periodic background backend flushing.
   * *Question:* For distributed workloads or databases that require read-after-write or strong lock-based consistency across nodes, are there plans to introduce synchronous flush overrides, transactional writes, or standard POSIX file locking (`flock`), or is ObjectFS positioned solely for loose-consistency / read-heavy use cases?
 
+---
+
+## 5. Standardized CAS Deployment Manifests
+* **Lack of Standalone Manifest File:** Currently, CAS is deployed during E2E tests using inline manifests in `tests/e2e/cas_e2e_test.go`, but unlike AgentFS (`k8s/manifest.yaml`) and ObjectFS (`k8s/objectfs.yaml`), it does not have a dedicated `k8s/cas.yaml` file.
+  * *Question:* Should we export and maintain a standard standalone CAS deployment manifest inside the `k8s/` folder for consistency and ease of manual deployment?
+
