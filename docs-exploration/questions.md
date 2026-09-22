@@ -51,4 +51,10 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **GCP Privileged Access on Remote Clusters:** The storage subsystems (like ObjectFS and WAL Buffer) interact with Google Cloud Storage (GCS) and AWS S3-compatible endpoints. On GKE, the canonical and secure way to grant these privileges is via Workload Identity Federation for GKE.
   * *Question:* Should the Kubernetes `ServiceAccount` templates under `k8s/` be pre-configured with annotations for Workload Identity (e.g., `iam.gke.io/gcp-service-account`), or is it assumed that users will attach IAM roles to the GKE worker node service accounts directly?
 
+---
+
+## 9. Secure Container Registry Access for KOPS-managed GCE Nodes
+* **Private Artifact Registry Access under KOPS:** On standard GKE, node default scopes/IAM service accounts are pre-configured to easily read from Google Artifact Registry (GAR) within the same project. Under KOPS on GCE, nodes may not have access by default, forcing users to manually grant the `roles/artifactregistry.reader` role or configure `imagePullSecrets`.
+  * *Question:* What is the recommended secure mechanism to configure KOPS clusters on GCE for private Artifact Registry integration? Should we configure GCP cloud scopes directly inside the KOPS `InstanceGroup` resources, or should we recommend using the GCR/GAR credential helper or Kubernetes `imagePullSecrets`?
+
 

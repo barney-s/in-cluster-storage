@@ -4,7 +4,8 @@ This directory houses living, developer-oriented documentation outlining the cor
 
 ## Index
 
-*   [Deployment Runbook](runbooks/deploy.md) — Executable step-by-step instructions to build, deploy, verify, and teardown storage subsystems on GKE in Google Cloud project `cnrm-barni-2`. *(Freshest)*
+*   [KOPS GCE Deployment Runbook](runbooks/deploy-kops-gce.md) — Executable step-by-step instructions to build, deploy, verify, and teardown storage subsystems on KOPS-managed Kubernetes clusters on GCE. *(Freshest)*
+*   [GKE Deployment Runbook](runbooks/deploy-gcp.md) — Executable step-by-step instructions to build, deploy, verify, and teardown storage subsystems on GKE in Google Cloud project `cnrm-barni-2`.
 *   [Recent Activity (Sept 21, 2026)](activity/2026-09-21.md) — Summary of major themes, code churn, and key merges over the last month.
 *   [Open Questions](questions.md) — Unresolved architectural ambiguities, scaling challenges, and future design paths.
 *   [Code Map](code-map.md) — Layout of directories, 20 most critical source files, and "Danger Zone" files sensitive to edits.
