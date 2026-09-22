@@ -1,5 +1,6 @@
 #!/bin/bash
 # Description: Automated KOPS on GCE runbook deployment for in-cluster-storage
+# Change: Enabled Uniform Bucket Level Access/storage.admin on state bucket, and removed escaping of $(VAR) inside literal EOF heredoc to prevent YAML syntax errors.
 # Pinned settings: Project: barni-cnrm-20260529, Cluster: ics3
 set -euo pipefail
 
@@ -22,9 +23,23 @@ gcloud config set project "${GCP_PROJECT}"
 echo "Checking if KOPS state GCS bucket ${KOPS_STATE_STORE} exists..."
 if ! gcloud storage buckets describe "${KOPS_STATE_STORE}" >/dev/null 2>&1; then
   echo "GCS state store bucket does not exist. Creating..."
-  gcloud storage buckets create "${KOPS_STATE_STORE}" --project="${GCP_PROJECT}" --location="${GCP_REGION}"
+  gcloud storage buckets create "${KOPS_STATE_STORE}" --project="${GCP_PROJECT}" --location="${GCP_REGION}" --uniform-bucket-level-access
 else
-  echo "GCS state store bucket already exists."
+  echo "GCS state store bucket already exists. Ensuring Uniform Bucket Level Access is enabled..."
+  gcloud storage buckets update "${KOPS_STATE_STORE}" --uniform-bucket-level-access
+fi
+
+# Dynamically grant storage.admin to the active workload identity principal to avoid HTTP 403 / 412 errors during KOPS reads
+echo "Ensuring active identity has storage.admin role on the state store bucket..."
+ACTIVE_PRINCIPAL=$(gcloud projects get-iam-policy "${GCP_PROJECT}" --format="value(bindings.members)" | tr -d "['\",]" | grep -o 'principal://[^ ]*' | sort -u | head -n 1 || true)
+if [ -n "${ACTIVE_PRINCIPAL}" ]; then
+  echo "Granting roles/storage.admin to ${ACTIVE_PRINCIPAL}..."
+  gcloud storage buckets add-iam-policy-binding "${KOPS_STATE_STORE}" \
+    --member="${ACTIVE_PRINCIPAL}" \
+    --role="roles/storage.admin" \
+    --quiet || true
+else
+  echo "Could not dynamically determine active workload identity principal. Skipping explicit grant."
 fi
 
 # 3. Authenticate Docker with Artifact Registry
@@ -46,7 +61,11 @@ if ! kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}
     --master-size=e2-standard-2 \
     --yes
 else
-  echo "KOPS cluster already exists."
+  echo "KOPS cluster already exists. Ensuring configuration is applied and kubeconfig is updated..."
+  kops update cluster \
+    --name="${KOPS_CLUSTER_NAME}" \
+    --state="${KOPS_STATE_STORE}" \
+    --yes
 fi
 
 # Validate cluster rollout (takes 5-10 minutes)
@@ -55,10 +74,30 @@ kops validate cluster --state="${KOPS_STATE_STORE}" --wait 10m
 
 # 5. Configure KOPS Node IAM Permissions for GAR access
 echo "Configuring KOPS compute instance IAM permissions for GAR access..."
+# 5a. Default Compute Service Account
 COMPUTE_SVC_ACCT=$(gcloud iam service-accounts list --filter="displayName:Compute Engine default service account" --format="value(email)" --project="${GCP_PROJECT}")
+if [ -n "${COMPUTE_SVC_ACCT}" ]; then
+  echo "Granting roles/artifactregistry.reader to default Compute service account ${COMPUTE_SVC_ACCT}..."
+  gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+    --member="serviceAccount:${COMPUTE_SVC_ACCT}" \
+    --role="roles/artifactregistry.reader" \
+    --quiet || true
+fi
+
+# 5b. Dedicated KOPS Node and Control-Plane Service Accounts
+KOPS_NODE_SA="node-${KOPS_CLUSTER_NAME//./-}@${GCP_PROJECT}.iam.gserviceaccount.com"
+echo "Granting roles/artifactregistry.reader to KOPS node service account ${KOPS_NODE_SA}..."
 gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
-  --member="serviceAccount:${COMPUTE_SVC_ACCT}" \
-  --role="roles/artifactregistry.reader"
+  --member="serviceAccount:${KOPS_NODE_SA}" \
+  --role="roles/artifactregistry.reader" \
+  --quiet || true
+
+KOPS_CP_SA="control-plane-${KOPS_CLUSTER_NAME//./-}@${GCP_PROJECT}.iam.gserviceaccount.com"
+echo "Granting roles/artifactregistry.reader to KOPS control-plane service account ${KOPS_CP_SA}..."
+gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+  --member="serviceAccount:${KOPS_CP_SA}" \
+  --role="roles/artifactregistry.reader" \
+  --quiet || true
 
 # 6. Create Artifact Registry Repository if not exists
 echo "Checking if Artifact Registry repository ${GAR_REPOSITORY} exists..."
@@ -159,7 +198,7 @@ spec:
       containers:
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
-          args: ["--v=5", "--csi-address=\$(ADDRESS)", "--kubelet-registration-path=\$(DRIVER_REG_SOCK_PATH)"]
+          args: ["--v=5", "--csi-address=$(ADDRESS)", "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"]
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -177,7 +216,7 @@ spec:
               add: ["SYS_ADMIN"]
           image: cas-node-daemon:latest
           imagePullPolicy: IfNotPresent
-          args: ["--v=5", "--endpoint=unix:///csi/csi.sock", "--nodeid=\$(NODE_ID)", "--storage-path=/var/cache/cas", "--controller-address=agentfs-controller.kube-agentfs-system.svc.cluster.local:50051"]
+          args: ["--v=5", "--endpoint=unix:///csi/csi.sock", "--nodeid=$(NODE_ID)", "--storage-path=/var/cache/cas", "--controller-address=agentfs-controller.kube-agentfs-system.svc.cluster.local:50051"]
           env:
             - name: NODE_ID
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }

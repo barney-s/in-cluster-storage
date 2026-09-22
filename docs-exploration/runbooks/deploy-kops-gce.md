@@ -59,9 +59,16 @@ export REGISTRY="${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${GAR_REPOSITORY}
    gcloud config set project "${GCP_PROJECT}"
    ```
 
-2. Create the GCS bucket for KOPS State Store (if not already created):
+2. Create the GCS bucket for KOPS State Store (if not already created) with Uniform Bucket Level Access enabled, and grant storage.admin to the active Workload Identity principal:
    ```bash
-   gcloud storage buckets create "${KOPS_STATE_STORE}" --project="${GCP_PROJECT}" --location="${GCP_REGION}"
+   gcloud storage buckets create "${KOPS_STATE_STORE}" --project="${GCP_PROJECT}" --location="${GCP_REGION}" --uniform-bucket-level-access
+
+   # Dynamically retrieve active principal and grant storage.admin on state store bucket to avoid HTTP 412/403 errors during KOPS reads
+   ACTIVE_PRINCIPAL=$(gcloud projects get-iam-policy "${GCP_PROJECT}" --format="value(bindings.members)" | tr -d "['\",]" | grep -o 'principal://[^ ]*' | sort -u | head -n 1)
+   gcloud storage buckets add-iam-policy-binding "${KOPS_STATE_STORE}" \
+     --member="${ACTIVE_PRINCIPAL}" \
+     --role="roles/storage.admin" \
+     --quiet
    ```
 
 3. Authenticate Docker with Google Artifact Registry:
@@ -94,15 +101,29 @@ kops validate cluster --state="${KOPS_STATE_STORE}" --wait 10m
 ```
 
 #### 2. Configure KOPS Node IAM Permissions for GAR access
-Bind the Artifact Registry Reader role to the Compute default service account so KOPS worker nodes can pull private images:
+Bind the Artifact Registry Reader role to the GCE default Compute service account as well as the dedicated KOPS worker node and control-plane service accounts so KOPS nodes can pull private images:
 
 ```bash
 # Retrieve the GCE default service account email
 COMPUTE_SVC_ACCT=$(gcloud iam service-accounts list --filter="displayName:Compute Engine default service account" --format="value(email)")
 
 # Bind the Artifact Registry Reader role to the Compute default service account
+if [ -n "${COMPUTE_SVC_ACCT}" ]; then
+  gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+    --member="serviceAccount:${COMPUTE_SVC_ACCT}" \
+    --role="roles/artifactregistry.reader"
+fi
+
+# Bind the Artifact Registry Reader role to the dedicated KOPS Node Service Account
+KOPS_NODE_SA="node-${KOPS_CLUSTER_NAME//./-}@${GCP_PROJECT}.iam.gserviceaccount.com"
 gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
-  --member="serviceAccount:${COMPUTE_SVC_ACCT}" \
+  --member="serviceAccount:${KOPS_NODE_SA}" \
+  --role="roles/artifactregistry.reader"
+
+# Bind the Artifact Registry Reader role to the dedicated KOPS Control-Plane Service Account
+KOPS_CP_SA="control-plane-${KOPS_CLUSTER_NAME//./-}@${GCP_PROJECT}.iam.gserviceaccount.com"
+gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+  --member="serviceAccount:${KOPS_CP_SA}" \
   --role="roles/artifactregistry.reader"
 ```
 
