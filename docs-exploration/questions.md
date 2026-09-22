@@ -57,4 +57,11 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **Private Artifact Registry Access under KOPS:** On standard GKE, node default scopes/IAM service accounts are pre-configured to easily read from Google Artifact Registry (GAR) within the same project. Under KOPS on GCE, nodes may not have access by default, forcing users to manually grant the `roles/artifactregistry.reader` role or configure `imagePullSecrets`.
   * *Question:* What is the recommended secure mechanism to configure KOPS clusters on GCE for private Artifact Registry integration? Should we configure GCP cloud scopes directly inside the KOPS `InstanceGroup` resources, or should we recommend using the GCR/GAR credential helper or Kubernetes `imagePullSecrets`?
 
+---
+
+## 10. KOPS GCE IAM Role Binding and setIamPolicy Permission Boundaries
+* **Lack of setIamPolicy in Editor Role:** To deploy a KOPS cluster on GCE, the KOPS CLI expects to automatically configure IAM roles and service accounts, requiring `resourcemanager.projects.setIamPolicy`. In standard sandbox environments, deployers are often bound to `roles/editor`, which does not include this high-privilege permission.
+  * *Question:* Should we document a minimal manual GCE IAM setup for KOPS so that users with `roles/editor` can still deploy KOPS on GCE without requiring project-level owner access? Or should we recommend that KOPS on GCE be deployed exclusively by identities holding `roles/owner` or custom roles with `setIamPolicy` capabilities?
+
+
 

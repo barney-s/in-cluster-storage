@@ -1,40 +1,48 @@
 # Runbook: Deploying In-Cluster Storage Subsystems to KOPS on GCE
 
-*Changed since last revision: Initial revision creating the deployment runbook for KOPS on GCE.*
+*Changed since last revision: Updated with verified local environment feasibility checklist, documented IAM permission boundary limitations on workload identity, added alternative parallel Google Cloud Build path for environments without local Docker, and updated repository build commands to use native `ap` tooling.*
+
+> ⚠️ **REQUIREMENTS NOT MET IN CURRENT WORKSPACE**: This runbook cannot be executed in the current workspace due to missing local tools (`kops`, `docker`) and missing GCP IAM permissions (`resourcemanager.projects.setIamPolicy`). Please refer to the **What this needs** checklist below for installation and permission grant commands.
 
 ## What this needs
 
 **Tier**: 2 — CSI driver node-daemons require host mounts (`/var/lib/kubelet`), privileged DaemonSets, hostPID, and kubelet plugin socket registration, which can only run on a full Kubernetes cluster with access to actual worker nodes (such as KOPS on GCE) and cannot land in a vcluster.
 
-*Assumptions*: Standard KOPS-managed Kubernetes clusters on Google Compute Engine (GCE) are used. The control plane and worker nodes run as native GCE VMs. Container images are built locally or via Google Cloud Build, pushed to Google Artifact Registry (GAR), and KOPS GCE instances are granted IAM access to pull from GAR.
+*Assumptions*: Standard KOPS-managed Kubernetes clusters on Google Compute Engine (GCE) are used. The control plane and worker nodes run as native GCE VMs. Container images are built locally, via native `ap` CLI, or using Google Cloud Build, then pushed to Google Artifact Registry (GAR). KOPS GCE instances are granted IAM access to pull from GAR.
 
-To execute this deployment, you will need:
-- **Local Tooling**:
-  - **kops CLI** (v1.28+) to manage the KOPS cluster lifecycle.
-  - **Go SDK** (v1.27.1+) to invoke the repository's build/lint tools.
-  - **Docker** (or compatible container runtime) to build and containerize the images.
-  - **gcloud CLI** configured and authenticated to GCP.
-  - **kubectl** to manage cluster resources.
-- **Credentials & Permissions**:
-  - GCP IAM permissions to create VM instances, disks, VPC networks, and GCS buckets for cluster state storage (e.g., `roles/owner` or `roles/editor` at the project level).
-  - GCP IAM role `roles/artifactregistry.admin` (Artifact Registry Administrator) to create repositories and push images.
-- **Teardown Cost**: GCE VM instance usage charges (defaulting to 3x `e2-standard-2` nodes and 1x `e2-standard-2` master) and standard Google Cloud Storage / Artifact Registry rates apply until the cluster and registries are explicitly deleted.
+### Feasibility Checklist (Probed in Workspace)
+
+| Tool / Permission | Status | Type | Purpose / Remediation Command |
+| :--- | :---: | :--- | :--- |
+| **gcloud CLI** | ✓ | Tool | Authenticates with GCP. Found at `/usr/bin/gcloud`. |
+| **Go SDK (v1.27.1+)** | ✓ | Tool | Invokes repository build/lint tools. Found at `/usr/local/go/bin/go`. |
+| **kubectl** | ✓ | Tool | Manages Kubernetes cluster resources. Found at `/usr/bin/kubectl`. |
+| **kops CLI (v1.28+)** | **✗ MISSING** | Tool | Manages KOPS cluster lifecycle.<br>`curl -Lo kops https://github.com/kubernetes/kops/releases/download/v1.28.2/kops-linux-amd64 && chmod +x kops && sudo mv kops /usr/local/bin/` |
+| **Docker Daemon** | **✗ MISSING** | Tool | Local container compilation.<br>`sudo apt-get update && sudo apt-get install -y docker.io`<br>*Alternative: Build via parallel Google Cloud Build jobs using `gcloud builds submit`.* |
+| **GCP Project** | ✓ | IAM | Access target project: `barni-cnrm-20260529`. |
+| **iam.serviceAccounts.create** | ✓ | IAM | Create KOPS control plane/worker node service accounts. |
+| **roles/artifactregistry.admin** | ✓ | IAM | Create Artifact Registry repositories and push/pull container images. |
+| **roles/storage.admin** | ✓ | IAM | Create and manage the KOPS GCS state store bucket. |
+| **resourcemanager.projects.setIamPolicy** | **✗ MISSING** | IAM | Bind GCP IAM roles to KOPS service accounts. This is a hard blocker for `kops create/update cluster` under active Workload Identity (`cnrm-barni-1.svc.id.goog`).<br>*Remediation*: Ask project owner to bind `roles/owner` or custom role with `resourcemanager.projects.setIamPolicy`: <br>`gcloud projects add-iam-policy-binding barni-cnrm-20260529 --member="principal://iam.googleapis.com/projects/438046655464/locations/global/workloadIdentityPools/cnrm-barni-1.svc.id.goog/subject/ns/barney-s/sa/factory-deployer" --role="roles/owner"` |
+
+- **Teardown Cost**: GCE VM usage charges (3x `e2-standard-2` workers and 1x `e2-standard-2` master), GCS bucket storage, and Artifact Registry rates apply until cluster and registries are deleted.
 
 ## Preconditions
 
-Set the following environment variables. Replace the placeholders with your target GCP configuration:
+Set the following environment variables. Sourced by default to match the active workspace settings:
 
 ```bash
 # Target GCP project ID
-export GCP_PROJECT="<your-gcp-project-id>"
+export GCP_PROJECT="barni-cnrm-20260529"
 
 # GCP/GCE Regional Configuration
 export GCP_REGION="us-central1"
 export GCP_ZONE="us-central1-a"
 
 # KOPS Cluster Configuration
-export KOPS_CLUSTER_NAME="ics-cluster.k8s.local" # Gossip-based cluster name
-export KOPS_STATE_STORE="gs://<your-unique-kops-state-bucket>" # GCS bucket for KOPS state
+export CLUSTER="ics2"
+export KOPS_CLUSTER_NAME="${CLUSTER}.k8s.local" # Gossip-based cluster name
+export KOPS_STATE_STORE="gs://${GCP_PROJECT}-${CLUSTER}-kops-state" # GCS bucket for KOPS state
 
 # Subsystems Deployment Configuration
 export GAR_LOCATION="us-central1"
@@ -53,12 +61,12 @@ export REGISTRY="${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${GAR_REPOSITORY}
 
 2. Create the GCS bucket for KOPS State Store (if not already created):
    ```bash
-   gsutil mb -p "${GCP_PROJECT}" -l "${GCP_REGION}" "${KOPS_STATE_STORE}"
+   gcloud storage buckets create "${KOPS_STATE_STORE}" --project="${GCP_PROJECT}" --location="${GCP_REGION}"
    ```
 
 3. Authenticate Docker with Google Artifact Registry:
    ```bash
-   gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev"
+   gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
    ```
 
 ## Steps
@@ -81,12 +89,12 @@ kops create cluster \
   --master-size=e2-standard-2 \
   --yes
 
-# Validate cluster rollout (may take 5-10 minutes to initialize GCE instances and services)
+# Validate cluster rollout (takes 5-10 minutes to initialize instances and services)
 kops validate cluster --state="${KOPS_STATE_STORE}" --wait 10m
 ```
 
 #### 2. Configure KOPS Node IAM Permissions for GAR access
-By default, KOPS-managed GCE nodes utilize the project's Compute Engine default service account or a KOPS-specific service account. To allow nodes to pull private images from Google Artifact Registry, assign the `artifactregistry.reader` role to the default service account:
+Bind the Artifact Registry Reader role to the Compute default service account so KOPS worker nodes can pull private images:
 
 ```bash
 # Retrieve the GCE default service account email
@@ -103,35 +111,62 @@ gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
 gcloud artifacts repositories create "${GAR_REPOSITORY}" \
   --repository-format=docker \
   --location="${GAR_LOCATION}" \
-  --description="In-cluster storage subsystem images"
+  --description="In-cluster storage subsystem images" \
+  --project="${GCP_PROJECT}"
 ```
 
 #### 4. Build and Push Container Images
-Build the container images locally and push them to Google Artifact Registry.
+Select one of the following paths to compile and register the container images.
 
-**Using Standard Docker Build (Manual Build & Push):**
+##### Path A: Using Parallel Google Cloud Build (Recommended when local Docker is missing)
+This path runs remote container compilation in GCP and does not require a local Docker daemon.
+
 ```bash
-# Build subsystem images
-docker build -t "${REGISTRY}/agentfs-controller:${IMAGE_TAG}" -f images/agentfs-controller/Dockerfile .
-docker build -t "${REGISTRY}/agentfs-node-daemon:${IMAGE_TAG}" -f images/agentfs-node-daemon/Dockerfile .
-docker build -t "${REGISTRY}/objectfs-controller:${IMAGE_TAG}" -f images/objectfs-controller/Dockerfile .
-docker build -t "${REGISTRY}/objectfs-node-daemon:${IMAGE_TAG}" -f images/objectfs-node-daemon/Dockerfile .
-docker build -t "${REGISTRY}/wal-buffer:${IMAGE_TAG}" -f images/wal-buffer/Dockerfile .
-docker build -t "${REGISTRY}/cas-node-daemon:${IMAGE_TAG}" -f images/cas-node-daemon/Dockerfile .
+# Submit parallel cloud builds for all six storage subsystems
+PIDS=()
+for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
+  cat <<EOF > "cloudbuild-${img}.yaml"
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: [ 'build', '-f', 'images/${img}/Dockerfile', '-t', '${REGISTRY}/${img}:${IMAGE_TAG}', '.' ]
+images:
+- '${REGISTRY}/${img}:${IMAGE_TAG}'
+EOF
 
-# Push built images to Artifact Registry
-docker push "${REGISTRY}/agentfs-controller:${IMAGE_TAG}"
-docker push "${REGISTRY}/agentfs-node-daemon:${IMAGE_TAG}"
-docker push "${REGISTRY}/objectfs-controller:${IMAGE_TAG}"
-docker push "${REGISTRY}/objectfs-node-daemon:${IMAGE_TAG}"
-docker push "${REGISTRY}/wal-buffer:${IMAGE_TAG}"
-docker push "${REGISTRY}/cas-node-daemon:${IMAGE_TAG}"
+  gcloud builds submit \
+    --project="${GCP_PROJECT}" \
+    --config="cloudbuild-${img}.yaml" \
+    . > "build-${img}.log" 2>&1 &
+  PIDS+=($!)
+done
+
+# Wait for parallel builds to finish
+echo "Waiting for all Google Cloud Builds to complete..."
+for pid in "${PIDS[@]}"; do
+  wait "${pid}"
+done
+
+# Check build logs and clean up configs
+for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
+  echo "=== Build log snapshot for ${img} ==="
+  tail -n 10 "build-${img}.log" || true
+  rm -f "build-${img}.log" "cloudbuild-${img}.yaml"
+done
 ```
 
-**Using the Native `ap` Tool (Alternative):**
+##### Path B: Using Local Docker Daemon (Requires local Docker)
 ```bash
-# Build all subsystem images using ap CLI
-go run github.com/gke-labs/gke-labs-infra/ap@latest build
+# Build subsystem images
+for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
+  docker build -t "${REGISTRY}/${img}:${IMAGE_TAG}" -f "images/${img}/Dockerfile" .
+  docker push "${REGISTRY}/${img}:${IMAGE_TAG}"
+done
+```
+
+##### Path C: Using the Repository's Native `ap` Tool (Requires local Docker & Go)
+```bash
+# Build all subsystem images using native ap CLI
+go run github.com/gke-labs/gke-labs-infra/ap@latest build //...
 
 # Tag and push built ap images to GAR
 for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
@@ -141,13 +176,13 @@ done
 ```
 
 #### 5. Update Manifests and Deploy Subsystems
-Dynamically inject your remote GAR registry images into the Kubernetes manifests and deploy them.
+Dynamically inject Artifact Registry images into the Kubernetes manifests and deploy them.
 
 ```bash
-# Create a temporary directory for modified manifests
+# Create temporary directory for updated manifests
 mkdir -p build/manifests
 
-# Replace local image placeholders with actual GAR references
+# Replace local image references with remote GAR targets
 sed -e "s|image: agentfs-controller:latest|image: ${REGISTRY}/agentfs-controller:${IMAGE_TAG}|g" \
     -e "s|image: agentfs-node-daemon:latest|image: ${REGISTRY}/agentfs-node-daemon:${IMAGE_TAG}|g" \
     k8s/manifest.yaml > build/manifests/manifest.yaml
@@ -159,20 +194,19 @@ sed -e "s|image: objectfs-controller:latest|image: ${REGISTRY}/objectfs-controll
 sed -e "s|image: wal-buffer:latest|image: ${REGISTRY}/wal-buffer:${IMAGE_TAG}|g" \
     k8s/wal.yaml > build/manifests/wal.yaml
 
-# Create namespaces
+# Create target namespaces
 kubectl create namespace kube-agentfs-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl create namespace kube-objectfs-system --dry-run=client -o yaml | kubectl apply -f -
 
-# Apply manifest files
+# Apply subsystem manifests
 kubectl apply -f build/manifests/manifest.yaml
 kubectl apply -f build/manifests/wal.yaml
 kubectl apply -f build/manifests/objectfs.yaml
 ```
 
-*(Optional) Deploy CAS CSI Driver:*
+##### (Optional) Deploy CAS CSI Driver
 ```bash
-# Create and apply CAS CSI Driver and node-daemon configs
-sed -e "s|image: cas-node-daemon:latest|image: ${REGISTRY}/cas-node-daemon:${IMAGE_TAG}|g" <<EOF | kubectl apply -f -
+sed -e "s|image: cas-node-daemon:latest|image: ${REGISTRY}/cas-node-daemon:${IMAGE_TAG}|g" <<'EOF' | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
@@ -245,7 +279,7 @@ EOF
 
 ## Verify
 
-Confirm healthy initialization and running status of all deployed subsystems on the KOPS cluster.
+Confirm healthy initialization of all deployed subsystems on the KOPS cluster.
 
 ### 1. Inspect Pod and CSI Statuses
 ```bash
@@ -259,12 +293,12 @@ kubectl get pods -n kube-objectfs-system -o wide
 
 ### 2. Validate with Log Checks
 ```bash
-# Verify controller can start without errors
-kubectl logs -n kube-agentfs-system statefulset/agentfs-controller -c agentfs-controller
-kubectl logs -n kube-objectfs-system statefulset/objectfs-controller -c objectfs-controller
+# Verify controller starts and registers correctly
+kubectl logs -n kube-agentfs-system statefulset/agentfs-controller -c agentfs-controller --tail=20
+kubectl logs -n kube-objectfs-system statefulset/objectfs-controller -c objectfs-controller --tail=20
 
-# Verify node-daemons can register CSI sockets
-kubectl logs -n kube-agentfs-system daemonset/agentfs-node-daemon -c agentfs-node-daemon --tail=50
+# Verify node-daemons can register CSI sockets and run without errors
+kubectl logs -n kube-agentfs-system daemonset/agentfs-node-daemon -c agentfs-node-daemon --tail=20
 ```
 
 ## Teardown
@@ -299,10 +333,11 @@ kops delete cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" 
 ### 3. Clean up GCS State Bucket and GAR Repository
 ```bash
 # Delete KOPS GCS state bucket
-gsutil rm -r "${KOPS_STATE_STORE}"
+gcloud storage buckets delete "${KOPS_STATE_STORE}" --quiet
 
 # Delete Artifact Registry Repository
 gcloud artifacts repositories delete "${GAR_REPOSITORY}" \
   --location="${GAR_LOCATION}" \
+  --project="${GCP_PROJECT}" \
   --quiet
 ```
