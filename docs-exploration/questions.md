@@ -39,3 +39,16 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **Image Pull Failure on Local Clusters:** The deployment manifests in `k8s/` use the `:latest` image tag without specifying an `imagePullPolicy`. When loaded into local `kind` clusters, Kubernetes defaults to `imagePullPolicy: Always` for `:latest` tags, causing `ImagePullBackOff` as it attempts to pull from a remote registry.
   * *Question:* Can `ap deploy` be configured to dynamically inject/override `imagePullPolicy: Never` or `imagePullPolicy: IfNotPresent` when targeting local clusters with `--skip-push`, or should developers continue to manually patch/rewrite the manifests before deployment?
 
+---
+
+## 7. Native Container Registry Overrides in `ap` CLI
+* **Lack of Configurable Target Registry:** Currently, the `ap build` and `ap deploy` commands do not expose CLI parameters or config-file options to specify a remote container registry (e.g., Google Artifact Registry under `cnrm-barni-2`).
+  * *Question:* How should multi-environment deployment registries be defined natively inside the `ap` tool (for example, through `ap config` or environment-variable bindings) to avoid manual tagging/pushing and manual manifest edits (`sed` scripting)?
+
+---
+
+## 8. IAM Integration & Workload Identity for CSI Drivers on GKE
+* **GCP Privileged Access on Remote Clusters:** The storage subsystems (like ObjectFS and WAL Buffer) interact with Google Cloud Storage (GCS) and AWS S3-compatible endpoints. On GKE, the canonical and secure way to grant these privileges is via Workload Identity Federation for GKE.
+  * *Question:* Should the Kubernetes `ServiceAccount` templates under `k8s/` be pre-configured with annotations for Workload Identity (e.g., `iam.gke.io/gcp-service-account`), or is it assumed that users will attach IAM roles to the GKE worker node service accounts directly?
+
+
