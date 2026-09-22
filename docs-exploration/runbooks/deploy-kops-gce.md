@@ -1,8 +1,8 @@
 # Runbook: Deploying In-Cluster Storage Subsystems to KOPS on GCE
 
-*Changed since last revision: Updated with verified local environment feasibility checklist, documented IAM permission boundary limitations on workload identity, added alternative parallel Google Cloud Build path for environments without local Docker, and updated repository build commands to use native `ap` tooling.*
+*Changed since last revision: Updated feasibility checklist to reflect newly installed local kops tool and granted GCP IAM permissions (resourcemanager.projects.setIamPolicy) under active Workload Identity, and confirmed Google Cloud Build is the verified and fully operational build path for this environment.*
 
-> ⚠️ **REQUIREMENTS NOT MET IN CURRENT WORKSPACE**: This runbook cannot be executed in the current workspace due to missing local tools (`kops`, `docker`) and missing GCP IAM permissions (`resourcemanager.projects.setIamPolicy`). Please refer to the **What this needs** checklist below for installation and permission grant commands.
+> ✓ **REQUIREMENTS MET IN CURRENT WORKSPACE**: All required CLI tools (`kops`, `kubectl`, `gcloud`, `go`) are installed, and GCP IAM permissions (`resourcemanager.projects.setIamPolicy`) are fully granted to the active Workload Identity account. While the local Docker daemon is unreachable, the Google Cloud Build path (Path A) is verified and fully operational.
 
 ## What this needs
 
@@ -17,13 +17,13 @@
 | **gcloud CLI** | ✓ | Tool | Authenticates with GCP. Found at `/usr/bin/gcloud`. |
 | **Go SDK (v1.27.1+)** | ✓ | Tool | Invokes repository build/lint tools. Found at `/usr/local/go/bin/go`. |
 | **kubectl** | ✓ | Tool | Manages Kubernetes cluster resources. Found at `/usr/bin/kubectl`. |
-| **kops CLI (v1.28+)** | **✗ MISSING** | Tool | Manages KOPS cluster lifecycle.<br>`curl -Lo kops https://github.com/kubernetes/kops/releases/download/v1.28.2/kops-linux-amd64 && chmod +x kops && sudo mv kops /usr/local/bin/` |
-| **Docker Daemon** | **✗ MISSING** | Tool | Local container compilation.<br>`sudo apt-get update && sudo apt-get install -y docker.io`<br>*Alternative: Build via parallel Google Cloud Build jobs using `gcloud builds submit`.* |
+| **kops CLI (v1.28+)** | ✓ | Tool | Manages KOPS cluster lifecycle. Verified at `/usr/local/bin/kops` (v1.28.2). |
+| **Docker Daemon** | **✗ UNREACHABLE** | Tool | Local container compilation. CLI present at `/usr/bin/docker`, but daemon is unreachable in this environment.<br>*Alternative*: Build via parallel Google Cloud Build jobs using `gcloud builds submit` (fully operational). |
 | **GCP Project** | ✓ | IAM | Access target project: `barni-cnrm-20260529`. |
 | **iam.serviceAccounts.create** | ✓ | IAM | Create KOPS control plane/worker node service accounts. |
 | **roles/artifactregistry.admin** | ✓ | IAM | Create Artifact Registry repositories and push/pull container images. |
 | **roles/storage.admin** | ✓ | IAM | Create and manage the KOPS GCS state store bucket. |
-| **resourcemanager.projects.setIamPolicy** | **✗ MISSING** | IAM | Bind GCP IAM roles to KOPS service accounts. This is a hard blocker for `kops create/update cluster` under active Workload Identity (`cnrm-barni-1.svc.id.goog`).<br>*Remediation*: Ask project owner to bind `roles/owner` or custom role with `resourcemanager.projects.setIamPolicy`: <br>`gcloud projects add-iam-policy-binding barni-cnrm-20260529 --member="principal://iam.googleapis.com/projects/438046655464/locations/global/workloadIdentityPools/cnrm-barni-1.svc.id.goog/subject/ns/barney-s/sa/factory-deployer" --role="roles/owner"` |
+| **resourcemanager.projects.setIamPolicy** | ✓ | IAM | Bind GCP IAM roles to KOPS service accounts. Fully granted via `roles/owner` binding on active Workload Identity (`cnrm-barni-1.svc.id.goog`). |
 
 - **Teardown Cost**: GCE VM usage charges (3x `e2-standard-2` workers and 1x `e2-standard-2` master), GCS bucket storage, and Artifact Registry rates apply until cluster and registries are deleted.
 
