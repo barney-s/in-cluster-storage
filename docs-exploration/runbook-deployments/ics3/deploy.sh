@@ -49,7 +49,7 @@ gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
 # 4. Create and Provision the KOPS Cluster
 echo "Checking if KOPS cluster ${KOPS_CLUSTER_NAME} exists..."
 if ! kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" >/dev/null 2>&1; then
-  echo "KOPS cluster does not exist. Generating configuration and provisioning..."
+  echo "KOPS cluster does not exist. Generating configuration (creating manifests inside state store)..."
   kops create cluster \
     --name="${KOPS_CLUSTER_NAME}" \
     --zones="${GCP_ZONE}" \
@@ -58,15 +58,19 @@ if ! kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}
     --cloud=gce \
     --node-count=3 \
     --node-size=e2-standard-2 \
-    --master-size=e2-standard-2 \
-    --yes
-else
-  echo "KOPS cluster already exists. Ensuring configuration is applied and kubeconfig is updated..."
-  kops update cluster \
-    --name="${KOPS_CLUSTER_NAME}" \
-    --state="${KOPS_STATE_STORE}" \
-    --yes
+    --master-size=e2-standard-2
+
+  echo "Exporting generated cluster configuration manifests to the deployment directory..."
+  mkdir -p docs-exploration/runbook-deployments/ics3/manifests
+  kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" -o yaml > docs-exploration/runbook-deployments/ics3/manifests/cluster.yaml
+  kops get ig --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" -o yaml >> docs-exploration/runbook-deployments/ics3/manifests/cluster.yaml
 fi
+
+echo "Updating cluster to actually provision cloud resources..."
+kops update cluster \
+  --name="${KOPS_CLUSTER_NAME}" \
+  --state="${KOPS_STATE_STORE}" \
+  --yes
 
 # Validate cluster rollout (takes 5-10 minutes)
 echo "Validating KOPS cluster rollout..."

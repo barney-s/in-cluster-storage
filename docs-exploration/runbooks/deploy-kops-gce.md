@@ -1,5 +1,7 @@
 # KOPS GCE Deployment Runbook
 
+*Revision Note: Updated Section 3 (Provision the KOPS Kubernetes Cluster) to sequence `kops create` (creating configuration manifests in GCS and exporting them to the local directory), `kops update` (actually provisioning resources in GCE), and `kops validate` for proper lifecycle management.*
+
 *(Pinned)* **This runbook is executable top-to-bottom on GCE.** It builds, deploys, verifies, and tears down the four core storage subsystems (`agentfs`, `objectfs`, `wal-buffer`, and `cas`) on a Kubernetes cluster managed by KOPS on Google Compute Engine (GCE).
 
 ---
@@ -87,9 +89,10 @@ fi
 ```
 
 ### 3. Provision the KOPS Kubernetes Cluster
-Create the GCE cluster configuration and deploy the VMs. This provisions 1 Master (Control Plane) and 3 Workers of type `e2-standard-2`:
+Generate the kOps cluster configuration manifests in the state store, export them to a local directory so they can be checked into git, then actually provision the VMs and network infrastructure on GCE. This provisions 1 Master (Control Plane) and 3 Workers of type `e2-standard-2`:
 ```bash
 if ! kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" >/dev/null 2>&1; then
+  # 1. Create the cluster definition (manifests) inside the GCS state store
   kops create cluster \
     --name="${KOPS_CLUSTER_NAME}" \
     --zones="${GCP_ZONE}" \
@@ -98,13 +101,19 @@ if ! kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}
     --cloud=gce \
     --node-count=3 \
     --node-size=e2-standard-2 \
-    --master-size=e2-standard-2 \
-    --yes
-else
-  kops update cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --yes
+    --master-size=e2-standard-2
+
+  # 2. Export the generated cluster configuration manifests so they can be checked into git
+  echo "Exporting generated kOps configuration manifests to the deployment directory..."
+  mkdir -p docs-exploration/runbook-deployments/ics3/manifests
+  kops get cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" -o yaml > docs-exploration/runbook-deployments/ics3/manifests/cluster.yaml
+  kops get ig --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" -o yaml >> docs-exploration/runbook-deployments/ics3/manifests/cluster.yaml
 fi
 
-# Validate cluster rollout (Wait up to 10 minutes for virtual machines to configure and register)
+# 3. Apply the manifests and actually provision the cloud infrastructure resources (VMs, network, etc.)
+kops update cluster --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --yes
+
+# 4. Validate cluster rollout (Wait up to 10 minutes for virtual machines to configure and register)
 kops validate cluster --state="${KOPS_STATE_STORE}" --wait 10m
 ```
 

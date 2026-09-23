@@ -65,6 +65,12 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 
 ---
 
+## 12. Tracking and Version-Controlling kOps Cluster & Instance Group Manifests
+* **Checking In kOps Configuration Files:** To comply with GitOps practices, the generated kOps cluster and instance group manifests are exported as YAML configurations and placed in the deployment-specific directory (e.g. `docs-exploration/runbook-deployments/ics3/manifests/`).
+  * *Question:* Should we establish a standard schema for directory-based deployment tracking of these manifests across other staging and production environments? How should we automate updates back to these files when live cluster specs are changed via `kops edit cluster`?
+
+---
+
 ## 11. Skip Justifications for In-Pod Deployment & Upgrade Runbooks
 * **Lack of In-Pod Story for Privileged Systems:** The storage subsystems (`agentfs`, `objectfs`, `cas`, and `wal-buffer`) are built as low-level Kubernetes CSI drivers and write-ahead log daemons.
   * *Justification for skipping `deploy-in-pod.md` & `upgrade-in-pod.md`:* CSI driver node-daemons require actual Kubernetes nodes with host mount access (`/var/lib/kubelet`), bidirectional mount propagation, privileged containers, and kernel capabilities (`SYS_ADMIN` and `fanotify`). Since a local "in-pod" sandbox cannot provide actual node-level host mounts or privileged namespaces, it is impossible to deploy, upgrade, or run these subsystems directly inside a plain pod sandbox or local non-privileged environment. Unit and integration tests (under `tests/e2e/`) run local `kind` clusters instead of raw "in-pod" environments, which also require an external container runtime daemon (like Docker). Therefore, the `in-pod` environment does not genuinely apply to this repository's subsystems, and these runbooks have been skipped in accordance with the Exploration Contract.
