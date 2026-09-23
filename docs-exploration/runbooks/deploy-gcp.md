@@ -1,6 +1,8 @@
 # Runbook: Deploying In-Cluster Storage Subsystems to GKE
 
-*Changed since last revision: Pivot deployment target from local Kind to Google Kubernetes Engine (GKE) under Google Cloud Platform (GCP) project `cnrm-barni-2`, utilizing Google Artifact Registry (GAR).*
+*Changed since last revision: Added verified feasibility checklist, and documented the Google Cloud Build remote compilation flow as a primary verified path due to unreachable local Docker daemon. Pivot deployment target from local Kind to Google Kubernetes Engine (GKE) under Google Cloud Platform (GCP) project `cnrm-barni-2`, utilizing Google Artifact Registry (GAR).*
+
+> ✓ **REQUIREMENTS MET IN CURRENT WORKSPACE**: All required CLI tools (`kubectl`, `gcloud`, `go`) are installed, and GCP IAM permissions (`roles/owner`) are fully granted to the active Workload Identity account. While the local Docker daemon is unreachable, the Google Cloud Build path (Path A) is verified and fully operational.
 
 ## What this needs
 
@@ -8,15 +10,18 @@
 
 *Assumptions*: Standard GKE clusters are used instead of GKE Autopilot, as CSI drivers require privileged capabilities (`SYS_ADMIN`) and bidirectional host volume mounts (`/var/lib/kubelet`) which are restricted by GKE Autopilot policies.
 
-To execute this deployment, you will need:
-- **Local Tooling**:
-  - **Go SDK** (v1.27.1+) to invoke the repository's build/lint tools.
-  - **Docker** (or compatible container runtime) to build and containerize the images.
-  - **gcloud CLI** configured and authenticated to GCP.
-  - **kubectl** to manage GKE resources.
-- **Credentials & Permissions**:
-  - IAM role `roles/container.admin` (Kubernetes Engine Admin) or equivalent cluster-admin RBAC permissions to create custom namespaces, `CSIDriver` definitions, custom `ClusterRole`/`ClusterRoleBindings`, and privileged `DaemonSets`.
-  - IAM role `roles/artifactregistry.admin` (Artifact Registry Administrator) to create repositories and push images.
+### Feasibility Checklist (Probed in Workspace)
+
+| Tool / Permission | Status | Type | Purpose / Remediation Command |
+| :--- | :---: | :--- | :--- |
+| **gcloud CLI** | ✓ | Tool | Authenticates with GCP. Found at `/usr/bin/gcloud`. |
+| **Go SDK (v1.27.1+)** | ✓ | Tool | Invokes repository build/lint tools. Found at `/usr/local/go/bin/go`. |
+| **kubectl** | ✓ | Tool | Manages Kubernetes cluster resources. Found at `/usr/bin/kubectl`. |
+| **Docker Daemon** | **✗ UNREACHABLE** | Tool | Local container compilation. CLI present at `/usr/bin/docker`, but daemon is unreachable in this environment.<br>*Alternative*: Build via parallel Google Cloud Build jobs using `gcloud builds submit` (fully operational). |
+| **GCP Project** | ✓ | IAM | Access target project: `barni-cnrm-20260529` (probed). |
+| **roles/container.admin** | ✓ | IAM | Create custom namespaces, CSIDriver, ClusterRole/Bindings, and privileged DaemonSets. Fully granted via `roles/owner` on active identity (`cnrm-barni-1.svc.id.goog`). |
+| **roles/artifactregistry.admin** | ✓ | IAM | Create Artifact Registry repositories and push/pull images. Fully granted via `roles/owner`. |
+
 - **Teardown Cost**: Standard GKE and Artifact Registry resource usage rates apply until resources are explicitly torn down.
 
 ## Preconditions
@@ -46,7 +51,7 @@ export REGISTRY="${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${GAR_REPOSITORY}
 
 2. Authenticate Docker with Google Artifact Registry:
    ```bash
-   gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev"
+   gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
    ```
 
 3. Configure `kubectl` to point to the GKE cluster:
@@ -71,9 +76,46 @@ gcloud artifacts repositories create "${GAR_REPOSITORY}" \
 ```
 
 #### 2. Build and Push Container Images
-Build the container images locally and push them to Google Artifact Registry.
+Select one of the following compilation paths based on local Docker accessibility.
 
-**Using Standard Docker Build (Manual Build & Push):**
+##### Path A: Remote Compiles via Google Cloud Build (Recommended when local Docker is unreachable)
+Submit remote container builds to compile the storage subsystems directly within GCP:
+
+```bash
+# Submit parallel cloud builds for storage subsystems
+PIDS=()
+for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
+  cat <<EOF > "cloudbuild-deploy-${img}.yaml"
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: [ 'build', '-f', 'images/${img}/Dockerfile', '-t', '${REGISTRY}/${img}:${IMAGE_TAG}', '.' ]
+images:
+- '${REGISTRY}/${img}:${IMAGE_TAG}'
+EOF
+
+  gcloud builds submit \
+    --project="${GCP_PROJECT}" \
+    --config="cloudbuild-deploy-${img}.yaml" \
+    . > "build-deploy-${img}.log" 2>&1 &
+  PIDS+=($!)
+done
+
+# Wait for parallel builds to finish
+echo "Waiting for all Google Cloud Builds to complete..."
+for pid in "${PIDS[@]}"; do
+  wait "${pid}"
+done
+
+# Clean up build files and print log summaries
+for img in agentfs-controller agentfs-node-daemon objectfs-controller objectfs-node-daemon wal-buffer cas-node-daemon; do
+  echo "=== Deploy build log snapshot for ${img} ==="
+  tail -n 10 "build-deploy-${img}.log" || true
+  rm -f "build-deploy-${img}.log" "cloudbuild-deploy-${img}.yaml"
+done
+```
+
+##### Path B: Local Compiles with Local Docker Daemon
+If a local Docker daemon is running in the sandbox:
 ```bash
 # Build subsystem images
 docker build -t "${REGISTRY}/agentfs-controller:${IMAGE_TAG}" -f images/agentfs-controller/Dockerfile .
@@ -92,7 +134,7 @@ docker push "${REGISTRY}/wal-buffer:${IMAGE_TAG}"
 docker push "${REGISTRY}/cas-node-daemon:${IMAGE_TAG}"
 ```
 
-**Using the Native `ap` Tool (Alternative):**
+##### Path C: Using the Repository's Native `ap` Tool
 ```bash
 # Build all subsystem images using ap CLI
 go run github.com/gke-labs/gke-labs-infra/ap@latest build

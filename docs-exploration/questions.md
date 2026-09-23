@@ -63,5 +63,11 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 * **Lack of setIamPolicy in Editor Role:** To deploy a KOPS cluster on GCE, the KOPS CLI expects to automatically configure IAM roles and service accounts, requiring `resourcemanager.projects.setIamPolicy`. In standard sandbox environments, deployers are often bound to `roles/editor`, which does not include this high-privilege permission.
   * *Question:* Should we document a minimal manual GCE IAM setup for KOPS so that users with `roles/editor` can still deploy KOPS on GCE without requiring project-level owner access? Or should we recommend that KOPS on GCE be deployed exclusively by identities holding `roles/owner` or custom roles with `setIamPolicy` capabilities?
 
+---
+
+## 11. Skip Justifications for In-Pod Deployment & Upgrade Runbooks
+* **Lack of In-Pod Story for Privileged Systems:** The storage subsystems (`agentfs`, `objectfs`, `cas`, and `wal-buffer`) are built as low-level Kubernetes CSI drivers and write-ahead log daemons.
+  * *Justification for skipping `deploy-in-pod.md` & `upgrade-in-pod.md`:* CSI driver node-daemons require actual Kubernetes nodes with host mount access (`/var/lib/kubelet`), bidirectional mount propagation, privileged containers, and kernel capabilities (`SYS_ADMIN` and `fanotify`). Since a local "in-pod" sandbox cannot provide actual node-level host mounts or privileged namespaces, it is impossible to deploy, upgrade, or run these subsystems directly inside a plain pod sandbox or local non-privileged environment. Unit and integration tests (under `tests/e2e/`) run local `kind` clusters instead of raw "in-pod" environments, which also require an external container runtime daemon (like Docker). Therefore, the `in-pod` environment does not genuinely apply to this repository's subsystems, and these runbooks have been skipped in accordance with the Exploration Contract.
+
 
 
