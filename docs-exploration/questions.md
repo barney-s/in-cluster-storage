@@ -78,10 +78,11 @@ This document tracks unresolved architectural ambiguities, scaling limits, and p
 ---
 
 ## 13. Next Steps on the Streams Work
-* **WAL Flow Control:** How should we implement application-level flow control or backpressure on WAL streams without introducing high overhead or latency spikes?
-* **Multiplexed Connections:** Will multiplexing hundreds of logical WAL streams over a single physical TCP connection hit gRPC internal queue bottlenecks or head-of-line blocking on heavy throughput?
-* **ObjectFS WatchVolume Resiliency:** When a network partition occurs and the `WatchVolume` gRPC stream reconnects, what is the optimal ring-buffer size the controller should keep for replaying missed events before forcing a full directory re-synchronization?
-* **Multipart Upload Memory Footprint:** To achieve true streaming, should the ObjectFS controller pipe chunks directly to the cloud backend (using `io.Pipe`) to completely avoid buffering part files on local controller disks?
+* **WAL Flow Control Mechanics:** How should application-level window credits be calculated and updated dynamically inside `Server.Append`? To avoid latency spikes, can we piggyback credits on standard `AppendResponse_Ack` messages or should we use a dedicated heartbeat/flow-control message type?
+* **WAL Multiplexing & gRPC Queue Head-of-Line Blocking:** If we multiplex hundreds of logical `streamImpl` sessions over a single physical gRPC bidi-stream connection, do we risk head-of-line blocking if one stream receives a massive burst of append writes? Should we introduce internal client-side and server-side worker pools to process multiplexed streams concurrently?
+* **ObjectFS WatchVolume Catchup & Ring-Buffer Sizing:** When a network partition occurs and a node-daemon reconnects to `WatchVolume`, what is the optimal ring-buffer size `EventBroadcaster` should maintain? How can we dynamically configure this size based on the average cluster file modification rate, and how do we prevent memory exhaustion in large clusters?
+* **ObjectFS Multipart Upload Stream Offloading:** For True streaming to AWS S3 / Google Cloud Storage, can the controller completely bypass local disk/memory buffering by piping the `io.Reader` from `WriteFile` requests directly to `UploadPart` using Go `io.Pipe`? What are the concurrency/retrial implications of failing a single part upload mid-stream?
+* **CAS Fallback Transport Security:** If the CAS client fails SCM_RIGHTS FD passing and falls back to standard network-based gRPC chunk streaming (e.g., when containers run on separate machines), how do we secure the remote network stream to prevent unauthorized access to content-addressable blobs across node boundaries?
 
 
 
