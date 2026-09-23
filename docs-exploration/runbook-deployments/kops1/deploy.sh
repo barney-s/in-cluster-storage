@@ -1,4 +1,5 @@
 #!/bin/bash
+# Change: Split GCS bucket creation/labeling; export admin kubeconfig & use direct control-plane IP; dynamically query control-plane service account; configure Cloud Build bucket to enforce Uniform Bucket Level Access (UBLA)
 # Description: Automated KOPS on GCE runbook deployment for in-cluster-storage (instance: kops1)
 # Pinned settings: Project: barni-cnrm-20260529, Cluster: ics-kops1, Prefix: ics-kops1
 set -euo pipefail
@@ -22,12 +23,14 @@ gcloud config set project "${GCP_PROJECT}"
 # 2. Check and Create GCS State Store Bucket
 echo "Checking if KOPS state GCS bucket ${KOPS_STATE_STORE} exists..."
 if ! gcloud storage buckets describe "${KOPS_STATE_STORE}" >/dev/null 2>&1; then
-  echo "GCS state store bucket does not exist. Creating with label repo-agent-instance=${RESOURCE_PREFIX}..."
+  echo "GCS state store bucket does not exist. Creating..."
   gcloud storage buckets create "${KOPS_STATE_STORE}" \
     --project="${GCP_PROJECT}" \
     --location="${GCP_REGION}" \
-    --uniform-bucket-level-access \
-    --labels=repo-agent-instance="${RESOURCE_PREFIX}"
+    --uniform-bucket-level-access
+  echo "Updating labels on new state store bucket..."
+  gcloud storage buckets update "${KOPS_STATE_STORE}" \
+    --update-labels=repo-agent-instance="${RESOURCE_PREFIX}"
 else
   echo "GCS state store bucket already exists. Ensuring Uniform Bucket Level Access is enabled and labels are updated..."
   gcloud storage buckets update "${KOPS_STATE_STORE}" \
@@ -79,6 +82,19 @@ kops update cluster \
   --state="${KOPS_STATE_STORE}" \
   --yes
 
+echo "Exporting admin credentials for kubeconfig..."
+kops export kubeconfig --name="${KOPS_CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --admin
+
+# Update kubeconfig to use the direct control plane IP instead of the load balancer IP to avoid health check timeouts
+CONTROL_PLANE_IP=$(gcloud compute instances list --project="${GCP_PROJECT}" --filter="name:control-plane" --format="value(networkInterfaces[0].accessConfigs[0].natIP)" | head -n 1)
+if [ -n "${CONTROL_PLANE_IP}" ]; then
+  echo "Updating kubeconfig to use direct control plane IP ${CONTROL_PLANE_IP} for faster and more reliable connection..."
+  CURRENT_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}' || true)
+  if [ -n "${CURRENT_SERVER}" ]; then
+    sed -i "s|${CURRENT_SERVER}|https://${CONTROL_PLANE_IP}|g" ~/.kube/config
+  fi
+fi
+
 # Validate cluster rollout (takes 5-10 minutes)
 echo "Validating KOPS cluster rollout..."
 kops validate cluster --state="${KOPS_STATE_STORE}" --wait 10m
@@ -103,12 +119,16 @@ gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
   --role="roles/artifactregistry.reader" \
   --quiet || true
 
-KOPS_CP_SA="control-plane-${KOPS_CLUSTER_NAME//./-}@${GCP_PROJECT}.iam.gserviceaccount.com"
-echo "Granting roles/artifactregistry.reader to KOPS control-plane service account ${KOPS_CP_SA}..."
-gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
-  --member="serviceAccount:${KOPS_CP_SA}" \
-  --role="roles/artifactregistry.reader" \
-  --quiet || true
+KOPS_CP_SA=$(gcloud iam service-accounts list --filter="email:control-plane-${CLUSTER}" --format="value(email)" --project="${GCP_PROJECT}" | head -n 1)
+if [ -n "${KOPS_CP_SA}" ]; then
+  echo "Granting roles/artifactregistry.reader to KOPS control-plane service account ${KOPS_CP_SA}..."
+  gcloud projects add-iam-policy-binding "${GCP_PROJECT}" \
+    --member="serviceAccount:${KOPS_CP_SA}" \
+    --role="roles/artifactregistry.reader" \
+    --quiet || true
+else
+  echo "Could not dynamically find KOPS control-plane service account starting with control-plane-${CLUSTER}. Skipping."
+fi
 
 # 6. Create Artifact Registry Repository if not exists
 echo "Checking if Artifact Registry repository ${GAR_REPOSITORY} exists..."
@@ -126,6 +146,19 @@ else
     --location="${GAR_LOCATION}" \
     --project="${GCP_PROJECT}" \
     --update-labels=repo-agent-instance="${RESOURCE_PREFIX}"
+fi
+
+# Ensure the cloudbuild source bucket has Uniform Bucket Level Access enabled if it exists
+CLOUDBUILD_BUCKET="gs://${GCP_PROJECT}_cloudbuild"
+echo "Ensuring Uniform Bucket Level Access is enabled on Cloud Build bucket ${CLOUDBUILD_BUCKET}..."
+if gcloud storage buckets describe "${CLOUDBUILD_BUCKET}" >/dev/null 2>&1; then
+  gcloud storage buckets update "${CLOUDBUILD_BUCKET}" --uniform-bucket-level-access
+else
+  # If it doesn't exist, we can pre-create it with UBLA enabled to prevent errors
+  gcloud storage buckets create "${CLOUDBUILD_BUCKET}" \
+    --project="${GCP_PROJECT}" \
+    --location="us" \
+    --uniform-bucket-level-access || true
 fi
 
 # 7. Build and Push Container Images using Parallel Google Cloud Build

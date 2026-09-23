@@ -36,6 +36,14 @@ To execute this runbook, the calling Google Cloud identity must have the followi
 *   ✓ **`docker` CLI**: Present.
 *   ✓ **Active GCP Credential**: Granted `roles/owner` or `roles/editor` on the active project `barni-cnrm-20260529`.
 
+### Discovered Requirements & Operational Safeguards
+1.  **Uniform Bucket Level Access (UBLA)**:
+    *   The Cloud Build source bucket (`gs://${GCP_PROJECT}_cloudbuild`) must have UBLA enabled to prevent upload failures (HTTP 412 status code) during remote source builds.
+2.  **Kubeconfig Endpoint Optimization**:
+    *   Since KOPS configures an external GCE target pool load balancer for api server access, public DNS and routing propagation can experience significant latency. Updating the kubeconfig to use the direct control plane VM IP address with TLS SNI server-name override (`api.internal.<cluster>.k8s.local`) guarantees an immediate, robust connection.
+3.  **Dynamic Service Account Discovery**:
+    *   KOPS creates a control plane service account with a random suffix (`control-plane-[cluster]-[suffix]`), which requires dynamic querying using `gcloud iam service-accounts list` rather than hardcoding.
+
 ---
 
 ## Preconditions

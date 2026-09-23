@@ -1,0 +1,98 @@
+apiVersion: kops.k8s.io/v1alpha2
+kind: Cluster
+metadata:
+  creationTimestamp: "2026-09-23T19:15:01Z"
+  name: ics-kops1.k8s.local
+spec:
+  api:
+    loadBalancer:
+      type: Public
+  authorization:
+    rbac: {}
+  channel: stable
+  cloudConfig: {}
+  cloudLabels:
+    repo-agent-instance: ics-kops1
+  cloudProvider: gce
+  configBase: gs://ics-kops1-kops-state/ics-kops1.k8s.local
+  etcdClusters:
+  - cpuRequest: 200m
+    etcdMembers:
+    - instanceGroup: control-plane-us-central1-a
+      name: a
+    manager:
+      backupRetentionDays: 90
+    memoryRequest: 100Mi
+    name: main
+  - cpuRequest: 100m
+    etcdMembers:
+    - instanceGroup: control-plane-us-central1-a
+      name: a
+    manager:
+      backupRetentionDays: 90
+    memoryRequest: 100Mi
+    name: events
+  iam:
+    allowContainerRegistry: true
+    legacy: false
+  kubeProxy:
+    enabled: false
+  kubelet:
+    anonymousAuth: false
+  kubernetesApiAccess:
+  - 0.0.0.0/0
+  - ::/0
+  kubernetesVersion: 1.30.14
+  networking:
+    cilium:
+      enableNodePort: true
+  nonMasqueradeCIDR: 100.64.0.0/10
+  project: barni-cnrm-20260529
+  sshAccess:
+  - 0.0.0.0/0
+  - ::/0
+  subnets:
+  - cidr: 10.0.16.0/20
+    name: us-central1
+    region: us-central1
+    type: Public
+  topology:
+    dns:
+      type: None
+apiVersion: kops.k8s.io/v1alpha2
+kind: InstanceGroup
+metadata:
+  creationTimestamp: "2026-09-23T19:15:01Z"
+  labels:
+    kops.k8s.io/cluster: ics-kops1.k8s.local
+  name: control-plane-us-central1-a
+spec:
+  image: ubuntu-os-cloud/ubuntu-2204-jammy-v20260612
+  machineType: e2-standard-2
+  maxSize: 1
+  minSize: 1
+  role: Master
+  subnets:
+  - us-central1
+  zones:
+  - us-central1-a
+
+---
+
+apiVersion: kops.k8s.io/v1alpha2
+kind: InstanceGroup
+metadata:
+  creationTimestamp: "2026-09-23T19:15:01Z"
+  labels:
+    kops.k8s.io/cluster: ics-kops1.k8s.local
+  name: nodes-us-central1-a
+spec:
+  image: ubuntu-os-cloud/ubuntu-2204-jammy-v20260612
+  machineType: e2-standard-2
+  maxSize: 3
+  minSize: 3
+  role: Node
+  subnets:
+  - us-central1
+  zones:
+  - us-central1-a
