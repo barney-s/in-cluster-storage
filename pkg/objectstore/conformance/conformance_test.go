@@ -17,8 +17,14 @@ limitations under the License.
 package conformance
 
 import (
+	"bufio"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/filesystemstorage"
 	"github.com/gke-labs/in-cluster-storage/pkg/objectstore/gcsstorage"
@@ -46,11 +52,12 @@ func TestS3BackendConformance(t *testing.T) {
 		endpoint = os.Getenv("AWS_ENDPOINT_URL")
 	}
 	bucket := os.Getenv("S3_TEST_BUCKET")
-	if endpoint == "" && bucket == "" {
-		t.Skip("Skipping S3 conformance test; neither S3_ENDPOINT nor S3_TEST_BUCKET set")
-	}
 	if bucket == "" {
 		bucket = "test-bucket"
+	}
+	if endpoint == "" && os.Getenv("S3_TEST_BUCKET") == "" {
+		// No real S3 configured: run against the in-repo fake (fakes3/).
+		endpoint = startFakeS3(t, bucket)
 	}
 
 	ctx := t.Context()
@@ -84,4 +91,79 @@ func TestGCSBackendConformance(t *testing.T) {
 	}
 
 	RunBackendTests(t, b)
+}
+
+// startFakeS3 builds the fakes3 binary from the sibling module in this repo,
+// starts it on an ephemeral port with the given bucket pre-created, and
+// returns its endpoint URL. The process is stopped when the test finishes.
+//
+// fakes3 is a separate Go module, so it cannot be imported from here without
+// a cross-module dependency; running the binary keeps the fake standalone.
+func startFakeS3(t *testing.T, bucket string) string {
+	t.Helper()
+
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not found on PATH; cannot build fakes3 for the S3 conformance test")
+	}
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	fakes3Dir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "fakes3")
+	if _, err := os.Stat(filepath.Join(fakes3Dir, "go.mod")); err != nil {
+		t.Fatalf("fakes3 module not found at %s: %v", fakes3Dir, err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "fakes3")
+	build := exec.Command(goBin, "build", "-o", bin, "./cmd/fakes3")
+	build.Dir = fakes3Dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building fakes3: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "--listen=127.0.0.1:0", "--buckets="+bucket, "--quiet")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fakes3: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	// The first stdout line is "fakes3 listening on http://127.0.0.1:PORT".
+	addrCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if _, addr, found := strings.Cut(line, "listening on "); found {
+				addrCh <- strings.TrimSpace(addr)
+				return
+			}
+		}
+		addrCh <- ""
+	}()
+	var endpoint string
+	select {
+	case endpoint = <-addrCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for fakes3 to report its address")
+	}
+	if endpoint == "" {
+		t.Fatal("fakes3 exited before reporting its address")
+	}
+
+	// The SDK needs some credentials to sign with; fakes3 ignores them.
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.Setenv("AWS_ACCESS_KEY_ID", "fakes3")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "fakes3")
+	}
+	return endpoint
 }

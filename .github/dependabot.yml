@@ -31,3 +31,12 @@ updates:
       go-dependencies:
         patterns:
           - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/fakes3"
+    schedule:
+      interval: "daily"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
