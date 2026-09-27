@@ -230,9 +230,9 @@ spec:
 	t.Logf("Successfully verified WAL E2E with buffer restart and replay!")
 }
 
-func TestWALMinIOE2E(t *testing.T) {
+func TestWALS3E2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
-		t.Skip("Skipping WAL MinIO S3 E2E test; RUN_E2E not set")
+		t.Skip("Skipping WAL S3 E2E test; RUN_E2E not set")
 	}
 
 	h := NewHarness(t, "wal-s3-e2e")
@@ -244,21 +244,25 @@ func TestWALMinIOE2E(t *testing.T) {
 	// Build images
 	h.DockerBuild("wal-buffer:e2e", filepath.Join(experimentRoot, "images/wal-buffer/Dockerfile"), experimentRoot)
 	h.DockerBuild("wal-client-test:e2e", filepath.Join(experimentRoot, "images/wal-client-test/Dockerfile"), experimentRoot)
+	// fakes3 is its own module; its image builds from that directory.
+	fakes3Root := filepath.Join(gitRoot, "fakes3")
+	h.DockerBuild("fakes3:e2e", filepath.Join(fakes3Root, "images/fakes3/Dockerfile"), fakes3Root)
 
 	// Load images into Kind
 	h.KindLoad("wal-buffer:e2e")
 	h.KindLoad("wal-client-test:e2e")
+	h.KindLoad("fakes3:e2e")
 
-	// 1. Deploy MinIO in Kind
-	minioYaml := `
+	// 1. Deploy fakes3 (in-memory S3 API) in Kind with the bucket pre-created
+	fakes3Yaml := `
 apiVersion: v1
 kind: Service
 metadata:
-  name: minio
+  name: fakes3
   namespace: default
 spec:
   selector:
-    app: minio
+    app: fakes3
   ports:
     - port: 9000
       targetPort: 9000
@@ -267,65 +271,40 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minio
+  name: fakes3
   namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: minio
+      app: fakes3
   template:
     metadata:
       labels:
-        app: minio
+        app: fakes3
     spec:
       containers:
-        - name: minio
-          image: quay.io/minio/minio:latest
+        - name: fakes3
+          image: fakes3:e2e
+          imagePullPolicy: Never
           args:
-            - "server"
-            - "/data"
-          env:
-            - name: MINIO_ROOT_USER
-              value: "minioadmin"
-            - name: MINIO_ROOT_PASSWORD
-              value: "minioadmin"
+            - "--listen=:9000"
+            - "--buckets=wal-bucket"
           ports:
             - containerPort: 9000
               name: s3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9000
 `
-	h.KubectlApplyContent("minio", minioYaml)
-	if err := h.WaitForDeployment("minio", "default", 2*time.Minute); err != nil {
-		t.Fatalf("MinIO deployment failed to start: %v", err)
-	}
-
-	// 2. Initialize MinIO bucket using mc job
-	mcJobYaml := `
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-setup
-  namespace: default
-spec:
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: mc
-          image: quay.io/minio/mc:latest
-          command:
-            - "/bin/sh"
-            - "-c"
-            - "until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done; mc mb --ignore-existing local/wal-bucket"
-`
-	h.KubectlApplyContent("minio-setup", mcJobYaml)
-	if err := h.WaitForJobSuccess("minio-setup", "default", 2*time.Minute); err != nil {
-		t.Logf("MinIO logs:\n%s\n", h.GetPodLogs("app=minio", "default"))
+	h.KubectlApplyContent("fakes3", fakes3Yaml)
+	if err := h.WaitForDeployment("fakes3", "default", 2*time.Minute); err != nil {
 		t.Logf("Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("MinIO bucket setup job failed: %v", err)
+		t.Fatalf("fakes3 deployment failed to start: %v", err)
 	}
 
-	// 3. Deploy WAL Buffer configured with S3 backend pointing to MinIO
+	// 2. Deploy WAL Buffer configured with S3 backend pointing to fakes3
 	walBufferS3Yaml := `
 apiVersion: v1
 kind: Service
@@ -365,12 +344,12 @@ spec:
             - "--v=5"
             - "--port=50051"
             - "--data-dir=/data"
-            - "--backend=s3://wal-bucket/e2e?endpoint=http://minio:9000&region=us-east-1"
+            - "--backend=s3://wal-bucket/e2e?endpoint=http://fakes3:9000&region=us-east-1"
           env:
             - name: AWS_ACCESS_KEY_ID
-              value: "minioadmin"
+              value: "fakes3"
             - name: AWS_SECRET_ACCESS_KEY
-              value: "minioadmin"
+              value: "fakes3"
             - name: AWS_REGION
               value: "us-east-1"
           ports:
@@ -510,7 +489,7 @@ spec:
 		t.Fatalf("Tail S3 did not succeed: %s", tailLogs)
 	}
 	h.DeletePod("wal-tail-s3", "default")
-	t.Logf("Successfully verified WAL E2E with S3/MinIO backend!")
+	t.Logf("Successfully verified WAL E2E with S3 (fakes3) backend!")
 }
 
 func waitForPodCompletion(h *Harness, podName, namespace string, timeout time.Duration) error {

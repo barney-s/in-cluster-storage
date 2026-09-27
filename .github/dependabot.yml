@@ -22,6 +22,8 @@ updates:
       go-dependencies:
         patterns:
           - "*"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "gomod"
     directory: "/cas"
@@ -31,3 +33,16 @@ updates:
       go-dependencies:
         patterns:
           - "*"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "gomod"
+    directory: "/fakes3"
+    schedule:
+      interval: "daily"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
