@@ -14,20 +14,22 @@
 
 version: 2
 updates:
+  # One entry covering every Go module in the repo. Combined with the group
+  # below, Dependabot opens a single pull request ("bump the go-dependencies
+  # group across N directories with M updates") instead of one per module.
+  # Add new modules here as they are created.
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/cas"
+      - "/fakes3"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
     groups:
       go-dependencies:
         patterns:
           - "*"
-
-  - package-ecosystem: "gomod"
-    directory: "/cas"
-    schedule:
-      interval: "daily"
-    groups:
-      go-dependencies:
-        patterns:
-          - "*"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
